@@ -2,12 +2,22 @@ require('dotenv').config();
 const express = require('express');
 const crypto  = require('crypto');
 const fetch   = require('node-fetch').default;
+const { createClient } = require('redis');
 
 const app = express();
 app.use(express.raw({ type: 'application/json' }));
 
+// ─── Redis Setup ───────────────────────────────────────────────────────────────
+const redis = createClient({ url: process.env.REDIS_URL });
+redis.on('error', err => console.error('❌ Redis error', err));
+redis.connect()
+  .then(() => console.log('✅ Redis connected'))
+  .catch(console.error);
+
+const QUEUE_KEY = 'shopifyOrdersQueue';
+
 // In-memory queue (swap for a DB in prod)
-const pendingOrders = [];
+// const pendingOrders = [];
 
 // Load your secrets
 const {
@@ -42,20 +52,24 @@ app.post('/webhooks/orders/create', async (req, res) => {
         qty:   li.quantity
       }))
   };
-  pendingOrders.push(record);
+
+  await redis.rPush(QUEUE_KEY, JSON.stringify(record));
+  // pendingOrders.push(record);
   console.log(`📥 Queued ${record.name} with ${record.items.length} items`);
   res.status(200).send('Queued');
 });
 
 // 2) Manual batch processing endpoint
 app.post('/batch/process', async (req, res) => {
-  if (pendingOrders.length === 0) {
-    return res.status(400).send('Nothing to process');
-  }
+
+  const raw = await redis.lRange(QUEUE_KEY, 0, -1);
+  if (raw.length === 0) return res.status(400).send('Nothing to process');
+
+  const pending = raw.map(s => JSON.parse(s));
 
   // 1) Aggregate SKUs across all queued Shopify orders
   const agg = {};
-  pendingOrders.forEach(o =>
+  pending.forEach(o =>
     o.items.forEach(({ sku, qty }) => {
       agg[sku] = (agg[sku] || 0) + qty;
     })
@@ -91,7 +105,7 @@ app.post('/batch/process', async (req, res) => {
   };
 
   const payload = {
-    customer:            `Batch of ${pendingOrders.length} orders`,
+    customer:            `Batch of ${pending.length} orders`,
     testOrder:           true,
     autoSelectWarehouse: true,
     rejectLineErrors:    false,
@@ -134,13 +148,15 @@ app.post('/batch/process', async (req, res) => {
       return res.status(500).send('Failed to create batch');
     }
 
-    const count = pendingOrders.length;
-    pendingOrders.length = 0; // clear queue
+    // const count = pendingOrders.length;
+    // pendingOrders.length = 0; // clear queue
 
-    console.log(`✅ Batch draft #${created.orderNumber} from ${count} orders`);
+    await redis.del(QUEUE_KEY);
+
+    console.log(`✅ Batch draft #${created.orderNumber} from ${pending.length} orders`);
     return res
       .status(200)
-      .send(`Batch order #${created.orderNumber} created from ${count} queued orders`);
+      .send(`Batch order #${created.orderNumber} created from ${pending.length} queued orders`);
   } catch (err) {
     console.error('❌ Error during batch:', err);
     return res.status(500).send('Error processing batch');
@@ -148,38 +164,35 @@ app.post('/batch/process', async (req, res) => {
 });
 
 // 3) Simple web UI to trigger the batch
-app.get('/batch/ui', (req, res) => {
-  // Build HTML for each queued order
-  const htmlOrders = pendingOrders.map(o => {
-    const lines = o.items.map(i =>
-      `<li>${i.title} (SKU ${i.sku}) × ${i.qty}</li>`
-    ).join('');
+app.get('/batch/ui', async (req, res) => {
+  const raw = await redis.lRange(QUEUE_KEY, 0, -1);
+  const pending = raw.map(s => JSON.parse(s));
+
+  const htmlOrders = pending.map(o => {
+    const lines = o.items
+      .map(i => `<li>${i.title} (SKU ${i.sku}) × ${i.qty}</li>`)
+      .join('');
     return `
-      <div style="margin-bottom:1.5rem;padding:1rem;border:1px solid #ddd">
+      <div style="border:1px solid #ccc;padding:1rem;margin-bottom:1rem">
         <strong>Order ${o.name}</strong><br>
         <small>Received: ${o.receivedAt}</small>
-        <ul>${lines}</ul>
+        <ul style="margin-top:0.5rem">${lines}</ul>
       </div>
     `;
   }).join('') || '<p><em>No orders queued.</em></p>';
 
-  // (Optional) Real-time price estimate:
-  // You could call S&S’s Products API here—fetch price per SKU, multiply by qty, sum.
-  // Budget a second or two for all the HTTP requests, then display “Subtotal: $XX.XX”.
-
   res.send(`
     <html><head><meta charset="utf-8"><title>Batch UI</title></head>
     <body style="font-family:sans-serif;max-width:700px;margin:2rem auto">
-      <h1>S&S Batch</h1>
-      <p><strong>${pendingOrders.length}</strong> orders pending</p>
+      <h1>S&S Batch Processor</h1>
+      <p><strong>${pending.length}</strong> orders queued</p>
       ${htmlOrders}
       <form method="POST" action="/batch/process">
         <button style="padding:0.75rem 1.5rem;font-size:1rem">
           Submit Order
         </button>
       </form>
-    </body>
-    </html>
+    </body></html>
   `);
 });
 
