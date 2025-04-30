@@ -5,7 +5,9 @@ const fetch   = require('node-fetch').default;
 const { createClient } = require('redis');
 
 const app = express();
+// parse raw JSON for webhooks, and form-encoded bodies for our UI
 app.use(express.raw({ type: 'application/json' }));
+app.use(express.urlencoded({ extended: true }));
 
 // ─── Redis Setup ───────────────────────────────────────────────────────────────
 const redis = createClient({ url: process.env.REDIS_URL });
@@ -16,10 +18,7 @@ redis.connect()
 
 const QUEUE_KEY = 'shopifyOrdersQueue';
 
-// In-memory queue (swap for a DB in prod)
-// const pendingOrders = [];
-
-// Load your secrets
+// Load secrets
 const {
   SHOPIFY_WEBHOOK_SECRET,
   SS_ACCOUNT_NUMBER,
@@ -28,18 +27,26 @@ const {
   SS_PAYMENT_PROFILE_EMAIL
 } = process.env;
 
-// Optional Shopify HMAC check
+// Shopify HMAC check (skips if no header for local/testing)
 function verifyShopifyWebhook(req) {
-  const hmacHeader   = req.get('X-Shopify-Hmac-Sha256');
-  const computedHmac = crypto
+  const hmacHeader = req.get('X-Shopify-Hmac-Sha256');
+  if (!hmacHeader) return true;
+  const computed = crypto
     .createHmac('sha256', SHOPIFY_WEBHOOK_SECRET)
     .update(req.body, 'utf8')
     .digest('base64');
-  return crypto.timingSafeEqual(Buffer.from(computedHmac), Buffer.from(hmacHeader));
+  return crypto.timingSafeEqual(
+    Buffer.from(computed, 'utf8'),
+    Buffer.from(hmacHeader, 'utf8')
+  );
 }
 
 // 1) When queuing each Shopify order, capture title + sku + qty
 app.post('/webhooks/orders/create', async (req, res) => {
+  if (!verifyShopifyWebhook(req)) {
+    return res.status(401).send('☠️ Unauthorized');
+  }
+
   const order = JSON.parse(req.body.toString());
   const record = {
     name:       order.name,
@@ -47,54 +54,70 @@ app.post('/webhooks/orders/create', async (req, res) => {
     items: order.line_items
       .filter(li => li.sku && li.sku.trim())
       .map(li => ({
-        title: li.title || li.name,   // product name from Shopify
+        title: li.title || li.name,
         sku:   li.sku,
         qty:   li.quantity
       }))
   };
 
   await redis.rPush(QUEUE_KEY, JSON.stringify(record));
-  // pendingOrders.push(record);
-  console.log(`📥 Queued ${record.name} with ${record.items.length} items`);
+  console.log(`📥 Queued ${record.name}`);
   res.status(200).send('Queued');
 });
 
 // 2) Manual batch processing endpoint
 app.post('/batch/process', async (req, res) => {
+  // get the array of selected indices
+  const rawSelected = req.body.selectedIndex;
+  if (!rawSelected) {
+    return res.status(400).send('No orders selected');
+  }
+  const selectedArray = Array.isArray(rawSelected) ? rawSelected : [rawSelected];
+  const selectedIndices = selectedArray
+    .map(str => parseInt(str, 10))
+    .filter(n => !isNaN(n));
 
-  const raw = await redis.lRange(QUEUE_KEY, 0, -1);
-  if (raw.length === 0) return res.status(400).send('Nothing to process');
+  if (selectedIndices.length === 0) {
+    return res.status(400).send('No valid orders selected');
+  }
 
-  const pending = raw.map(s => JSON.parse(s));
+  // pull entire queue as raw strings
+  const rawQueue = await redis.lRange(QUEUE_KEY, 0, -1);
+  const queuedOrders = rawQueue.map(s => JSON.parse(s));
 
-  // 1) Aggregate SKUs across all queued Shopify orders
+  // build toProcess list
+  const toProcess = selectedIndices
+    .filter(i => i >= 0 && i < queuedOrders.length)
+    .map(i => queuedOrders[i]);
+
+  if (toProcess.length === 0) {
+    return res.status(400).send('Selected orders not found');
+  }
+
+  // 1) Aggregate SKUs
   const agg = {};
-  pending.forEach(o =>
+  toProcess.forEach(o =>
     o.items.forEach(({ sku, qty }) => {
       agg[sku] = (agg[sku] || 0) + qty;
     })
   );
 
-  // 2) Fetch live unit prices and compute subtotal
+  // 2) Fetch prices & compute subtotal
   const authHeader = 'Basic ' +
     Buffer.from(`${SS_ACCOUNT_NUMBER}:${SS_API_KEY}`).toString('base64');
-
   let subtotal = 0;
   for (const [sku, qty] of Object.entries(agg)) {
-    // GET the product details for this SKU
     const prodRes = await fetch(
       `https://api.ssactivewear.com/v2/products/${encodeURIComponent(sku)}?mediatype=json`,
       { headers: { Authorization: authHeader, Accept: 'application/json' } }
     );
     const prodJson = await prodRes.json();
-
-    // The Products API returns a "Price" field for each SKU :contentReference[oaicite:0]{index=0}&#8203;:contentReference[oaicite:1]{index=1}
     const unitPrice = prodJson.Price ?? prodJson.price;
     subtotal += unitPrice * qty;
   }
   console.log(`💰 Subtotal (before tax & shipping): $${subtotal.toFixed(2)}`);
 
-  // 3) Build your normal batch payload
+  // 3) Build batch payload
   const shopAddress = {
     name:     'LoGo Fishin Attn: TJ Reid',
     address1: '328 Bristlecone Ct S',
@@ -105,7 +128,7 @@ app.post('/batch/process', async (req, res) => {
   };
 
   const payload = {
-    customer:            `Batch of ${pending.length} orders`,
+    customer:            `Batch of ${toProcess.length} orders`,
     testOrder:           true,
     autoSelectWarehouse: true,
     rejectLineErrors:    false,
@@ -129,7 +152,7 @@ app.post('/batch/process', async (req, res) => {
 
   console.log('🚀 Sending BATCH to S&S:', payload);
 
-  // 4) Fire it off
+  // 4) Fire it off and then remove each processed order from Redis
   try {
     const resp = await fetch('https://api.ssactivewear.com/v2/orders/', {
       method:  'POST',
@@ -148,15 +171,18 @@ app.post('/batch/process', async (req, res) => {
       return res.status(500).send('Failed to create batch');
     }
 
-    // const count = pendingOrders.length;
-    // pendingOrders.length = 0; // clear queue
+    // Remove processed orders one by one by matching the raw JSON string
+    // sort descending so indexes don't shift
+    for (const idx of selectedIndices.sort((a,b)=>b-a)) {
+      const rawItem = rawQueue[idx];
+      await redis.lRem(QUEUE_KEY, 1, rawItem);
+      console.log(`🗑️ Removed queue item at index ${idx}`);
+    }
 
-    await redis.del(QUEUE_KEY);
-
-    console.log(`✅ Batch draft #${created.orderNumber} from ${pending.length} orders`);
+    console.log(`✅ Batch draft #${created.orderNumber} from ${toProcess.length} orders`);
     return res
       .status(200)
-      .send(`Batch order #${created.orderNumber} created from ${pending.length} queued orders`);
+      .send(`Batch order #${created.orderNumber} created from ${toProcess.length} queued orders`);
   } catch (err) {
     console.error('❌ Error during batch:', err);
     return res.status(500).send('Error processing batch');
@@ -168,15 +194,23 @@ app.get('/batch/ui', async (req, res) => {
   const raw = await redis.lRange(QUEUE_KEY, 0, -1);
   const pending = raw.map(s => JSON.parse(s));
 
-  const htmlOrders = pending.map(o => {
+  const htmlOrders = pending.map((o, idx) => {
     const lines = o.items
       .map(i => `<li>${i.title} (SKU ${i.sku}) × ${i.qty}</li>`)
       .join('');
     return `
       <div style="border:1px solid #ccc;padding:1rem;margin-bottom:1rem">
-        <strong>Order ${o.name}</strong><br>
-        <small>Received: ${o.receivedAt}</small>
-        <ul style="margin-top:0.5rem">${lines}</ul>
+        <label style="display:block;cursor:pointer">
+          <input
+            type="checkbox"
+            name="selectedIndex"
+            value="${idx}"
+            checked
+            style="margin-right:0.5rem"
+          >
+          <strong>Order ${o.name}</strong> <small>(received ${o.receivedAt})</small>
+          <ul style="margin-top:0.5rem">${lines}</ul>
+        </label>
       </div>
     `;
   }).join('') || '<p><em>No orders queued.</em></p>';
@@ -186,9 +220,9 @@ app.get('/batch/ui', async (req, res) => {
     <body style="font-family:sans-serif;max-width:700px;margin:2rem auto">
       <h1>S&S Batch Processor</h1>
       <p><strong>${pending.length}</strong> orders queued</p>
-      ${htmlOrders}
       <form method="POST" action="/batch/process">
-        <button style="padding:0.75rem 1.5rem;font-size:1rem">
+        ${htmlOrders}
+        <button type="submit" style="padding:0.75rem 1.5rem;font-size:1rem">
           Submit Order
         </button>
       </form>
