@@ -42,14 +42,19 @@ function verifyShopifyWebhook(req) {
 }
 
 // 1) When queuing each Shopify order, capture title + sku + qty
-app.post('/webhooks/orders/create', async (req, res) => {
+app.post('/webhooks/orders/paid', async (req, res) => {
   if (!verifyShopifyWebhook(req)) {
     return res.status(401).send('☠️ Unauthorized');
   }
 
   const order = JSON.parse(req.body.toString());
+
+  const customerName = order.customer
+    ? `${order.customer.first_name || ''} ${order.customer.last_name || ''}`.trim()
+    : 'Guest';
+
   const record = {
-    name:       order.name,
+    name: `${order.name} – ${customerName}`,
     receivedAt: new Date().toLocaleString(),
     items: order.line_items
       .filter(li => li.sku && li.sku.trim())
