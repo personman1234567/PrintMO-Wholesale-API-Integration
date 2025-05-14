@@ -20,11 +20,7 @@ const QUEUE_KEY = 'shopifyOrdersQueue';
 
 // Load secrets
 const {
-  SHOPIFY_WEBHOOK_SECRET,
-  SS_ACCOUNT_NUMBER,
-  SS_API_KEY,
-  SS_PAYMENT_PROFILE_ID,
-  SS_PAYMENT_PROFILE_EMAIL
+  SHOPIFY_WEBHOOK_SECRET
 } = process.env;
 
 // Shopify HMAC check (skips if no header for local/testing)
@@ -41,7 +37,6 @@ function verifyShopifyWebhook(req) {
   );
 }
 
-// 1) When queuing each Shopify order, capture title + sku + qty
 app.post('/webhooks/orders/paid', async (req, res) => {
   if (!verifyShopifyWebhook(req)) {
     return res.status(401).send('☠️ Unauthorized');
@@ -49,191 +44,41 @@ app.post('/webhooks/orders/paid', async (req, res) => {
 
   const order = JSON.parse(req.body.toString());
 
+  // Build the display name
   const customerName = order.customer
     ? `${order.customer.first_name || ''} ${order.customer.last_name || ''}`.trim()
     : 'Guest';
 
+  // Grab Shopify's subtotal directly
+  const subtotal = parseFloat(
+    order.current_subtotal_price   // Shopify payload field
+    || order.subtotal_price        // fallback
+    || 0
+  );
+
+  // Map every line_item, tagging print items (no SKU) vs apparel
+  const items = order.line_items.map(li => {
+    return {
+      title:    li.title || li.name,
+      sku:      li.sku || null,
+      qty:      li.quantity
+    };
+  });
+
+  // Build the enriched record
   const record = {
-    name: `${order.name} – ${customerName}`,
-    receivedAt: new Date().toLocaleString(),
-    items: order.line_items
-      .filter(li => li.sku && li.sku.trim())
-      .map(li => ({
-        title: li.title || li.name,
-        sku:   li.sku,
-        qty:   li.quantity
-      }))
+    name:       `${order.name} – ${customerName}`,
+    receivedAt: new Date().toISOString(),
+    subtotal,
+    items
   };
 
+  // Push to Redis
   await redis.rPush(QUEUE_KEY, JSON.stringify(record));
-  console.log(`📥 Queued ${record.name}`);
+  console.log(`📥 Queued ${record.name} (subtotal $${subtotal.toFixed(2)})`);
   res.status(200).send('Queued');
 });
 
-// 2) Manual batch processing endpoint
-app.post('/batch/process', async (req, res) => {
-  // get the array of selected indices
-  const rawSelected = req.body.selectedIndex;
-  if (!rawSelected) {
-    return res.status(400).send('No orders selected');
-  }
-  const selectedArray = Array.isArray(rawSelected) ? rawSelected : [rawSelected];
-  const selectedIndices = selectedArray
-    .map(str => parseInt(str, 10))
-    .filter(n => !isNaN(n));
-
-  if (selectedIndices.length === 0) {
-    return res.status(400).send('No valid orders selected');
-  }
-
-  // pull entire queue as raw strings
-  const rawQueue = await redis.lRange(QUEUE_KEY, 0, -1);
-  const queuedOrders = rawQueue.map(s => JSON.parse(s));
-
-  // build toProcess list
-  const toProcess = selectedIndices
-    .filter(i => i >= 0 && i < queuedOrders.length)
-    .map(i => queuedOrders[i]);
-
-  if (toProcess.length === 0) {
-    return res.status(400).send('Selected orders not found');
-  }
-
-  // 1) Aggregate SKUs
-  const agg = {};
-  toProcess.forEach(o =>
-    o.items.forEach(({ sku, qty }) => {
-      agg[sku] = (agg[sku] || 0) + qty;
-    })
-  );
-
-  // 2) Fetch prices & compute subtotal
-  const authHeader = 'Basic ' +
-    Buffer.from(`${SS_ACCOUNT_NUMBER}:${SS_API_KEY}`).toString('base64');
-  let subtotal = 0;
-  for (const [sku, qty] of Object.entries(agg)) {
-    const prodRes = await fetch(
-      `https://api.ssactivewear.com/v2/products/${encodeURIComponent(sku)}?mediatype=json`,
-      { headers: { Authorization: authHeader, Accept: 'application/json' } }
-    );
-    const prodJson = await prodRes.json();
-    const unitPrice = prodJson.Price ?? prodJson.price;
-    subtotal += unitPrice * qty;
-  }
-  console.log(`💰 Subtotal (before tax & shipping): $${subtotal.toFixed(2)}`);
-
-  // 3) Build batch payload
-  const shopAddress = {
-    name:     'LoGo Fishin Attn: TJ Reid',
-    address1: '328 Bristlecone Ct S',
-    city:     'Saint Charles',
-    province: 'MO',
-    zip:      '63304',
-    country:  'USA'
-  };
-
-  const payload = {
-    customer:            `Batch of ${toProcess.length} orders`,
-    testOrder:           true,
-    autoSelectWarehouse: true,
-    rejectLineErrors:    false,
-    shippingAddress: {
-      Name:    shopAddress.name,
-      Address: shopAddress.address1,
-      City:    shopAddress.city,
-      State:   shopAddress.province,
-      Zip:     shopAddress.zip,
-      Country: shopAddress.country
-    },
-    Lines: Object.entries(agg).map(([sku, qty]) => ({
-      Identifier: sku,
-      Qty:        qty
-    })),
-    PaymentProfile: {
-      ProfileID: parseInt(SS_PAYMENT_PROFILE_ID, 10),
-      Email:     SS_PAYMENT_PROFILE_EMAIL
-    }
-  };
-
-  console.log('🚀 Sending BATCH to S&S:', payload);
-
-  // 4) Fire it off and then remove each processed order from Redis
-  try {
-    const resp = await fetch('https://api.ssactivewear.com/v2/orders/', {
-      method:  'POST',
-      headers: {
-        'Content-Type':  'application/json',
-        'Authorization': authHeader
-      },
-      body:    JSON.stringify(payload)
-    });
-    const json = await resp.json();
-    console.log('📤 S&S batch response:', json);
-
-    const created = Array.isArray(json.orders) && json.orders[0];
-    if (!created || !created.orderNumber) {
-      console.error('❌ Batch creation failed:', json);
-      return res.status(500).send('Failed to create batch');
-    }
-
-    // Remove processed orders one by one by matching the raw JSON string
-    // sort descending so indexes don't shift
-    for (const idx of selectedIndices.sort((a,b)=>b-a)) {
-      const rawItem = rawQueue[idx];
-      await redis.lRem(QUEUE_KEY, 1, rawItem);
-      console.log(`🗑️ Removed queue item at index ${idx}`);
-    }
-
-    console.log(`✅ Batch draft #${created.orderNumber} from ${toProcess.length} orders`);
-    return res
-      .status(200)
-      .send(`Batch order #${created.orderNumber} created from ${toProcess.length} queued orders`);
-  } catch (err) {
-    console.error('❌ Error during batch:', err);
-    return res.status(500).send('Error processing batch');
-  }
-});
-
-// 3) Simple web UI to trigger the batch
-app.get('/batch/ui', async (req, res) => {
-  const raw = await redis.lRange(QUEUE_KEY, 0, -1);
-  const pending = raw.map(s => JSON.parse(s));
-
-  const htmlOrders = pending.map((o, idx) => {
-    const lines = o.items
-      .map(i => `<li>${i.title} (SKU ${i.sku}) × ${i.qty}</li>`)
-      .join('');
-    return `
-      <div style="border:1px solid #ccc;padding:1rem;margin-bottom:1rem">
-        <label style="display:block;cursor:pointer">
-          <input
-            type="checkbox"
-            name="selectedIndex"
-            value="${idx}"
-            checked
-            style="margin-right:0.5rem"
-          >
-          <strong>Order ${o.name}</strong> <small>(received ${o.receivedAt})</small>
-          <ul style="margin-top:0.5rem">${lines}</ul>
-        </label>
-      </div>
-    `;
-  }).join('') || '<p><em>No orders queued.</em></p>';
-
-  res.send(`
-    <html><head><meta charset="utf-8"><title>Batch UI</title></head>
-    <body style="font-family:sans-serif;max-width:700px;margin:2rem auto">
-      <h1>S&S Batch Processor</h1>
-      <p><strong>${pending.length}</strong> orders queued</p>
-      <form method="POST" action="/batch/process">
-        ${htmlOrders}
-        <button type="submit" style="padding:0.75rem 1.5rem;font-size:1rem">
-          Submit Order
-        </button>
-      </form>
-    </body></html>
-  `);
-});
 
 // Start server
 const PORT = process.env.PORT || 3000;
