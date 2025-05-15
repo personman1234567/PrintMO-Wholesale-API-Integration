@@ -38,6 +38,7 @@ function verifyShopifyWebhook(req) {
 }
 
 app.post('/webhooks/orders/paid', async (req, res) => {
+  console.log(`\n[Webhook Triggered] orders/paid at ${new Date().toISOString()}`);
   if (!verifyShopifyWebhook(req)) {
     return res.status(401).send('☠️ Unauthorized');
   }
@@ -58,18 +59,34 @@ app.post('/webhooks/orders/paid', async (req, res) => {
 
   // Map every line_item, tagging print items (no SKU) vs apparel
   const items = order.line_items.map(li => {
+    const unitPrice = parseFloat(li.price || '0') || 0;
+    const qty       = li.quantity || 0;
     return {
       title:    li.title || li.name,
       sku:      li.sku || null,
-      qty:      li.quantity
+      qty,
+      unitPrice,
+      lineTotal: parseFloat((unitPrice * qty).toFixed(2)),
+      variantId:    li.variant_id,        
+      variantTitle: li.variant_title || ''
     };
   });
+
+  // Total discounts applied
+  // Shopify sends both `current_total_discounts` and `total_discounts`; use whichever is non‑zero
+  const discount = parseFloat(order.total_discounts || order.current_total_discounts || '0') || 0;
+
+  // Final total charged (after discounts, before tax/shipping)
+  // Shopify’s payload has `total_price` (after discounts) and `current_total_price`
+  const total = parseFloat(order.total_price || order.current_total_price || '0') || 0;
 
   // Build the enriched record
   const record = {
     name:       `${order.name} – ${customerName}`,
     receivedAt: new Date().toISOString(),
     subtotal,
+    discount,
+    total,
     items
   };
 
