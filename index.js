@@ -1,7 +1,7 @@
 require('dotenv').config();
 const express = require('express');
 const crypto  = require('crypto');
-const fetch   = require('node-fetch').default; // kept for future use (optional GETs)
+const fetch   = require('node-fetch').default; // reserved for future use
 const { createClient } = require('redis');
 
 const app = express();
@@ -18,11 +18,8 @@ redis.connect()
 
 const QUEUE_KEY = 'shopifyOrdersQueue';
 
-// Load secrets & config
-const {
-  SHOPIFY_WEBHOOK_SECRET,
-  PUBLIC_R2_BASE // e.g., https://pub-xxxxxxxxxxxxxxxxxxxx.r2.dev (no trailing slash)
-} = process.env;
+// Load secrets (optional PUBLIC_R2_BASE if you want to force a host)
+const { SHOPIFY_WEBHOOK_SECRET, PUBLIC_R2_BASE } = process.env;
 
 // ─── Helpers ──────────────────────────────────────────────────────────────────
 function verifyShopifyWebhook(req) {
@@ -49,7 +46,7 @@ function extFromBasename(name) {
 }
 
 function sideFromBasename(name) {
-  const m = String(name || '').match(/_(front|back|left|right|breast)(?:\.[^.]+)?$/i);
+  const m = String(name || '').match(/_(front|back|left|right|breast|side)(?:\.[^.]+)?$/i);
   return m ? m[1].toLowerCase() : '';
 }
 
@@ -65,18 +62,39 @@ function propertiesToMap(line) {
   return out;
 }
 
-function basenameFromUrl(u) {
-  try { return new URL(u).pathname.split('/').pop() || ''; } catch { return ''; }
+function tryURL(u) { try { return new URL(u); } catch { return null; } }
+function basenameFromPath(p) {
+  if (!p) return '';
+  const parts = p.split('/');
+  return parts[parts.length - 1] || '';
 }
 
-// Build permanent orders URL from preview URL + order context
-function toOrdersAssetUrl({ previewUrl, orderNumber, custSlug, designRef }) {
-  if (!previewUrl || !orderNumber || !custSlug || !designRef || !PUBLIC_R2_BASE) return null;
-  const base = String(PUBLIC_R2_BASE).replace(/\/+$/, '');
-  const basename = basenameFromUrl(previewUrl);
-  if (!basename) return null;
-  const key = `orders/${orderNumber}_${custSlug}/${designRef}/${basename}`;
-  return { key, url: `${base}/${key}`, basename };
+/**
+ * Convert a preview URL to a promoted ORDERS URL.
+ * previews/YYYY-MM-DD/<designRef>/<rest>  →  orders/${orderNumber}_${custSlug}/<designRef>/<rest>
+ */
+function promotedUrlFromPreview(previewUrl, { orderNumber, custSlug, designRef }) {
+  if (!previewUrl || !orderNumber || !custSlug || !designRef) return null;
+  const u = tryURL(previewUrl);
+  if (!u) return null;
+
+  const baseOrigin = (PUBLIC_R2_BASE && PUBLIC_R2_BASE.replace(/\/+$/, '')) || u.origin;
+
+  // Expected: /previews/2025-11-07/<designRef>/<rest...>
+  const re = /^\/previews\/\d{4}-\d{2}-\d{2}\/([^/]+)\/(.+)$/;
+  const m = u.pathname.match(re);
+
+  let rest = '';
+  if (m && m[2]) {
+    // If the captured designRef doesn't match, still use the provided designRef; keep the remainder.
+    rest = m[2];
+  } else {
+    // Fallback: just take the basename and let the rest be that file
+    rest = basenameFromPath(u.pathname);
+  }
+
+  const key = `orders/${orderNumber}_${custSlug}/${designRef}/${rest}`;
+  return { key, url: `${baseOrigin}/${key}`, rest };
 }
 
 // ─── Webhook ──────────────────────────────────────────────────────────────────
@@ -98,25 +116,28 @@ app.post('/webhooks/orders/paid', async (req, res) => {
   const discount = parseFloat(order.total_discounts || order.current_total_discounts || 0) || 0;
   const total    = parseFloat(order.total_price || order.current_total_price || 0) || 0;
 
-  // Map every line_item and opportunistically attach assets derived from preview URL
+  let derivedAssets = 0;
+
+  // Map every line_item and attach a promoted orders URL derived from preview URL
   const items = (order.line_items || []).map(li => {
     const unitPrice = parseFloat(li.price || '0') || 0;
     const qty       = li.quantity || 0;
     const props     = propertiesToMap(li);
 
     // designRef in properties (support both keys)
-    const designRef = (props['_designref'] || props['_design_ref'] || '').toString().trim();
+    const designRef  = (props['_designref'] || props['_design_ref'] || '').toString().trim();
     const previewUrl = (props['design_preview_url'] || props['design-preview-url'] || '').toString().trim();
 
-    // Compute a single asset (mockup or design) from the preview URL → orders URL
     let assets = [];
     if (designRef && previewUrl) {
-      const built = toOrdersAssetUrl({ previewUrl, orderNumber, custSlug, designRef });
+      const built = promotedUrlFromPreview(previewUrl, { orderNumber, custSlug, designRef });
       if (built) {
-        const ext  = extFromBasename(built.basename);
-        const side = sideFromBasename(built.basename) || null;
+        const fileName = basenameFromPath(built.url);
+        const ext  = extFromBasename(fileName);
+        const side = sideFromBasename(fileName) || null;
         const role = li.sku ? 'mockup' : 'design';
         assets.push({ key: built.key, url: built.url, ext, side, role });
+        derivedAssets++;
       }
     }
 
@@ -129,8 +150,7 @@ app.post('/webhooks/orders/paid', async (req, res) => {
       variantId:    li.variant_id,
       variantTitle: li.variant_title || '',
       designRef: designRef || null,
-      assets, // single derived asset when previewUrl is present
-      // Optional helpful raw fields for debugging
+      assets,
       _previewUrl: previewUrl || null
     };
   });
@@ -149,7 +169,7 @@ app.post('/webhooks/orders/paid', async (req, res) => {
 
   // Push to Redis
   await redis.rPush(QUEUE_KEY, JSON.stringify(record));
-  console.log(`📥 Queued ${record.name} (subtotal $${subtotal.toFixed(2)})`);
+  console.log(`📥 Queued ${record.name} (subtotal $${subtotal.toFixed(2)}), assets derived: ${derivedAssets}`);
   res.status(200).send('Queued');
 });
 
