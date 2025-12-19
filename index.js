@@ -102,6 +102,19 @@ function promotedUrlFromPreview(previewUrl, { orderNumber, custSlug, designRef }
   return { key, url: `${baseOrigin}/${key}`, rest };
 }
 
+function normalizeName(s) {
+  return String(s || '')
+    .normalize('NFKC')
+    .replace(/[‐-‒–—―]/g, '-')     // any dash variant -> hyphen
+    .replace(/\s+/g, ' ')          // collapse whitespace
+    .trim();
+}
+
+function extractOrderNumberFromName(name) {
+  const m = String(name || '').match(/#?(\d{3,})/);
+  return m ? m[1] : null;
+}
+
 const UI_ORIGIN = process.env.ORDER_MANAGER_UI_ORIGIN || 'https://print-mo-order-manager.pages.dev';
 const ADMIN_KEY = process.env.ORDER_MANAGER_ADMIN_KEY;
 
@@ -221,10 +234,17 @@ app.get('/order-manager/queue', cors(corsOptions), requireAdminKey, async (req, 
 app.patch('/order-manager/orders/status', cors(corsOptions), requireAdminKey, async (req, res) => {
   const { name, status } = req.body || {};
 
-  if (typeof name !== 'string' || !name.trim()) return res.status(400).json({ error: 'Missing name' });
-  if (typeof status !== 'string' || !ALLOWED_STATUSES.has(status)) return res.status(400).json({ error: 'Bad status' });
+  if (typeof name !== 'string' || !name.trim()) {
+    return res.status(400).json({ error: 'Missing name' });
+  }
+  if (typeof status !== 'string' || !ALLOWED_STATUSES.has(status)) {
+    return res.status(400).json({ error: 'Bad status' });
+  }
 
   const items = await redis.lRange(QUEUE_KEY, 0, -1);
+
+  const reqNorm = normalizeName(name);
+  const reqOrderNumber = extractOrderNumberFromName(name);
 
   let foundIndex = -1;
   let rec = null;
@@ -232,15 +252,36 @@ app.patch('/order-manager/orders/status', cors(corsOptions), requireAdminKey, as
   for (let i = 0; i < items.length; i++) {
     try {
       const r = JSON.parse(items[i]);
-      if (r && r.name === name) {
-        foundIndex = i;
-        rec = r;
-        break;
+      if (!r) continue;
+
+      // 1) exact name match
+      if (r.name === name) { foundIndex = i; rec = r; break; }
+
+      // 2) normalized name match
+      if (normalizeName(r.name) === reqNorm) { foundIndex = i; rec = r; break; }
+
+      // 3) orderNumber match (more stable)
+      if (reqOrderNumber && String(r.orderNumber) === String(reqOrderNumber)) {
+        foundIndex = i; rec = r; break;
       }
     } catch {}
   }
 
-  if (foundIndex === -1) return res.status(404).json({ error: 'Order not found' });
+  if (foundIndex === -1) {
+    // return useful debugging info so we can see what the server saw
+    const sample = [];
+    for (let i = 0; i < Math.min(items.length, 5); i++) {
+      try { sample.push(JSON.parse(items[i])?.name); } catch {}
+    }
+    return res.status(404).json({
+      error: 'Order not found',
+      queueLength: items.length,
+      requestedName: name,
+      requestedNameNormalized: reqNorm,
+      requestedOrderNumber: reqOrderNumber,
+      sampleNames: sample.filter(Boolean),
+    });
+  }
 
   rec.status = status;
   await redis.lSet(QUEUE_KEY, foundIndex, JSON.stringify(rec));
