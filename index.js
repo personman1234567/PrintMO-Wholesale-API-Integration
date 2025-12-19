@@ -309,6 +309,163 @@ app.patch('/order-manager/orders/status', requireAdminKey, async (req, res) => {
   res.json({ ok: true });
 });
 
+// ---- Shared helpers for order-manager mutations ----
+function asInt01(v, fallback = 0) {
+  if (v === true) return 1;
+  if (v === false) return 0;
+  const n = Number(v);
+  if (Number.isFinite(n)) return n;
+  return fallback;
+}
+
+function asString(v, fallback = '') {
+  if (v === null || v === undefined) return fallback;
+  return String(v);
+}
+
+function normalizeRecord(rec) {
+  if (!rec.status) rec.status = 'received';
+  if (rec.blanksStatus == null) rec.blanksStatus = 0;
+  if (rec.printsStatus == null) rec.printsStatus = 0;
+  if (rec.blanksOrdered == null) rec.blanksOrdered = 0;
+  if (rec.printsOrdered == null) rec.printsOrdered = 0;
+  if (rec.notes == null) rec.notes = '';
+  if (rec.bundle == null) rec.bundle = '';
+  if (!Array.isArray(rec.attachments)) rec.attachments = []; // metadata only for now
+  return rec;
+}
+
+async function withOrderByName(name, mutatorFn) {
+  const items = await redis.lRange(QUEUE_KEY, 0, -1);
+
+  const reqNorm = normalizeName(name);
+  const reqOrderNumber = extractOrderNumberFromName(name);
+
+  let foundIndex = -1;
+  let rec = null;
+
+  for (let i = 0; i < items.length; i++) {
+    try {
+      const r = normalizeRecord(JSON.parse(items[i]));
+      if (!r) continue;
+
+      if (r.name === name) { foundIndex = i; rec = r; break; }
+      if (normalizeName(r.name) === reqNorm) { foundIndex = i; rec = r; break; }
+      if (reqOrderNumber && String(r.orderNumber) === String(reqOrderNumber)) { foundIndex = i; rec = r; break; }
+    } catch {}
+  }
+
+  if (foundIndex === -1) {
+    const sampleNames = [];
+    for (let i = 0; i < Math.min(items.length, 5); i++) {
+      try { sampleNames.push(JSON.parse(items[i])?.name); } catch {}
+    }
+    return { ok: false, status: 404, body: { error: 'Order not found', queueLength: items.length, requestedName: name, sampleNames: sampleNames.filter(Boolean) } };
+  }
+
+  // mutate + save
+  mutatorFn(rec);
+  normalizeRecord(rec);
+  await redis.lSet(QUEUE_KEY, foundIndex, JSON.stringify(rec));
+  return { ok: true, status: 200, body: { ok: true } };
+}
+
+// ---- Endpoints: Notes, Bundle, Ready/Progress, Rename, Delete ----
+
+// Notes
+app.patch('/order-manager/orders/notes', requireAdminKey, async (req, res) => {
+  const { name, notes } = req.body || {};
+  if (typeof name !== 'string' || !name.trim()) return res.status(400).json({ error: 'Missing name' });
+
+  const result = await withOrderByName(name, (rec) => {
+    rec.notes = asString(notes, '');
+  });
+
+  return res.status(result.status).json(result.body);
+});
+
+// Bundle (set or clear)
+app.patch('/order-manager/orders/bundle', requireAdminKey, async (req, res) => {
+  const { name, bundle } = req.body || {};
+  if (typeof name !== 'string' || !name.trim()) return res.status(400).json({ error: 'Missing name' });
+
+  const result = await withOrderByName(name, (rec) => {
+    rec.bundle = asString(bundle, '').trim();
+  });
+
+  return res.status(result.status).json(result.body);
+});
+
+// Ready flags (the checkboxes / header state)
+app.patch('/order-manager/orders/ready', requireAdminKey, async (req, res) => {
+  const { name, blanksStatus, printsStatus, blanksOrdered, printsOrdered } = req.body || {};
+  if (typeof name !== 'string' || !name.trim()) return res.status(400).json({ error: 'Missing name' });
+
+  const result = await withOrderByName(name, (rec) => {
+    if (blanksStatus !== undefined) rec.blanksStatus = asInt01(blanksStatus, rec.blanksStatus ?? 0);
+    if (printsStatus !== undefined) rec.printsStatus = asInt01(printsStatus, rec.printsStatus ?? 0);
+    if (blanksOrdered !== undefined) rec.blanksOrdered = asInt01(blanksOrdered, rec.blanksOrdered ?? 0);
+    if (printsOrdered !== undefined) rec.printsOrdered = asInt01(printsOrdered, rec.printsOrdered ?? 0);
+  });
+
+  return res.status(result.status).json(result.body);
+});
+
+// Progress (generic numeric field; if your UI calls updateProgress)
+app.patch('/order-manager/orders/progress', requireAdminKey, async (req, res) => {
+  const { name, progress } = req.body || {};
+  if (typeof name !== 'string' || !name.trim()) return res.status(400).json({ error: 'Missing name' });
+
+  const result = await withOrderByName(name, (rec) => {
+    rec.progress = asInt01(progress, rec.progress ?? 0);
+  });
+
+  return res.status(result.status).json(result.body);
+});
+
+// Rename (careful: your UI uses name as identity; only use if you really need it)
+app.patch('/order-manager/orders/rename', requireAdminKey, async (req, res) => {
+  const { name, newName } = req.body || {};
+  if (typeof name !== 'string' || !name.trim()) return res.status(400).json({ error: 'Missing name' });
+  if (typeof newName !== 'string' || !newName.trim()) return res.status(400).json({ error: 'Missing newName' });
+
+  const result = await withOrderByName(name, (rec) => {
+    rec.name = newName.trim();
+  });
+
+  return res.status(result.status).json(result.body);
+});
+
+// Delete
+app.post('/order-manager/orders/delete', requireAdminKey, async (req, res) => {
+  const { name } = req.body || {};
+  if (typeof name !== 'string' || !name.trim()) return res.status(400).json({ error: 'Missing name' });
+
+  const items = await redis.lRange(QUEUE_KEY, 0, -1);
+
+  const reqNorm = normalizeName(name);
+  const reqOrderNumber = extractOrderNumberFromName(name);
+
+  let foundIndex = -1;
+
+  for (let i = 0; i < items.length; i++) {
+    try {
+      const r = JSON.parse(items[i]);
+      if (!r) continue;
+
+      if (r.name === name) { foundIndex = i; break; }
+      if (normalizeName(r.name) === reqNorm) { foundIndex = i; break; }
+      if (reqOrderNumber && String(r.orderNumber) === String(reqOrderNumber)) { foundIndex = i; break; }
+    } catch {}
+  }
+
+  if (foundIndex === -1) return res.status(404).json({ error: 'Order not found' });
+
+  await redis.lRem(QUEUE_KEY, 1, items[foundIndex]); // remove first matching serialized entry
+  return res.json({ ok: true });
+});
+
+
 // ─── Start server ──────────────────────────────────────────────────────────────
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => console.log(`Listening on port ${PORT}`));
