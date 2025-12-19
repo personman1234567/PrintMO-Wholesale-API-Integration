@@ -3,10 +3,15 @@ const express = require('express');
 const crypto  = require('crypto');
 const fetch   = require('node-fetch').default; // reserved for future use
 const { createClient } = require('redis');
+const cors = require('cors');
 
 const app = express();
 // parse raw JSON for webhooks, and form-encoded bodies for our UI
-app.use(express.raw({ type: 'application/json' }));
+// app.use(express.raw({ type: 'application/json' }));
+// app.use(express.urlencoded({ extended: true }));
+
+// For normal API routes (dashboard calls)
+app.use(express.json({ limit: '2mb' }));
 app.use(express.urlencoded({ extended: true }));
 
 // ─── Redis Setup ───────────────────────────────────────────────────────────────
@@ -97,8 +102,30 @@ function promotedUrlFromPreview(previewUrl, { orderNumber, custSlug, designRef }
   return { key, url: `${baseOrigin}/${key}`, rest };
 }
 
+const UI_ORIGIN = process.env.ORDER_MANAGER_UI_ORIGIN || 'https://print-mo-order-manager.pages.dev';
+const ADMIN_KEY = process.env.ORDER_MANAGER_ADMIN_KEY;
+
+function requireAdminKey(req, res, next) {
+  const key = req.get('X-Order-Manager-Key');
+  if (!ADMIN_KEY) return res.status(500).json({ error: 'Missing ORDER_MANAGER_ADMIN_KEY on server' });
+  if (!key || key !== ADMIN_KEY) return res.status(401).json({ error: 'Unauthorized' });
+  next();
+}
+
+const corsOptions = {
+  origin(origin, cb) {
+    if (!origin) return cb(null, true);
+    if (origin === UI_ORIGIN) return cb(null, true);
+    if (origin.endsWith('.print-mo-order-manager.pages.dev')) return cb(null, true);
+    return cb(new Error('CORS blocked: ' + origin));
+  },
+  methods: ['GET', 'PATCH', 'OPTIONS'],
+  allowedHeaders: ['Content-Type', 'X-Order-Manager-Key'],
+};
+
+
 // ─── Webhook ──────────────────────────────────────────────────────────────────
-app.post('/webhooks/orders/paid', async (req, res) => {
+app.post('/webhooks/orders/paid', express.raw({ type: 'application/json' }), async (req, res) => {
   console.log(`\n[Webhook Triggered] orders/paid at ${new Date().toISOString()}`);
   if (!verifyShopifyWebhook(req)) return res.status(401).send('☠️ Unauthorized');
 
@@ -172,6 +199,54 @@ app.post('/webhooks/orders/paid', async (req, res) => {
   console.log(`📥 Queued ${record.name} (subtotal $${subtotal.toFixed(2)}), assets derived: ${derivedAssets}`);
   res.status(200).send('Queued');
 });
+
+const ALLOWED_STATUSES = new Set(['received', 'toOrder', 'blanks', 'print']);
+
+function normalizeRecord(rec) {
+  if (!rec.status) rec.status = 'received';
+  return rec;
+}
+
+app.get('/order-manager/queue', cors(corsOptions), requireAdminKey, async (req, res) => {
+  const items = await redis.lRange(QUEUE_KEY, 0, -1);
+  const orders = [];
+  for (const s of items) {
+    try {
+      orders.push(normalizeRecord(JSON.parse(s)));
+    } catch {}
+  }
+  res.json({ orders });
+});
+
+app.patch('/order-manager/orders/status', cors(corsOptions), requireAdminKey, async (req, res) => {
+  const { name, status } = req.body || {};
+
+  if (typeof name !== 'string' || !name.trim()) return res.status(400).json({ error: 'Missing name' });
+  if (typeof status !== 'string' || !ALLOWED_STATUSES.has(status)) return res.status(400).json({ error: 'Bad status' });
+
+  const items = await redis.lRange(QUEUE_KEY, 0, -1);
+
+  let foundIndex = -1;
+  let rec = null;
+
+  for (let i = 0; i < items.length; i++) {
+    try {
+      const r = JSON.parse(items[i]);
+      if (r && r.name === name) {
+        foundIndex = i;
+        rec = r;
+        break;
+      }
+    } catch {}
+  }
+
+  if (foundIndex === -1) return res.status(404).json({ error: 'Order not found' });
+
+  rec.status = status;
+  await redis.lSet(QUEUE_KEY, foundIndex, JSON.stringify(rec));
+  res.json({ ok: true });
+});
+
 
 // Start server
 const PORT = process.env.PORT || 3000;
