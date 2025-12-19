@@ -151,9 +151,8 @@ const corsOptions = {
   allowedHeaders: ['Content-Type', 'X-Order-Manager-Key'],
 };
 
-// Apply CORS + preflight handling for all /order-manager routes
+// Apply CORS for all /order-manager requests (this alone is enough to satisfy preflight)
 app.use('/order-manager', cors(corsOptions));
-app.options('/order-manager/*', cors(corsOptions));
 
 // Parse JSON bodies ONLY for /order-manager routes (so webhook raw body stays intact)
 app.use('/order-manager', express.json({ limit: '2mb' }));
@@ -231,7 +230,6 @@ app.post('/webhooks/orders/paid', express.raw({ type: 'application/json' }), asy
     discount,
     total,
     items,
-    // you can set this explicitly; UI also backfills if missing
     status: 'received',
   };
 
@@ -283,25 +281,10 @@ app.patch('/order-manager/orders/status', requireAdminKey, async (req, res) => {
       const r = JSON.parse(items[i]);
       if (!r) continue;
 
-      // 1) exact name match
-      if (r.name === name) {
-        foundIndex = i;
-        rec = r;
-        break;
-      }
-
-      // 2) normalized name match
-      if (normalizeName(r.name) === reqNorm) {
-        foundIndex = i;
-        rec = r;
-        break;
-      }
-
-      // 3) orderNumber match (more stable)
+      if (r.name === name) { foundIndex = i; rec = r; break; }
+      if (normalizeName(r.name) === reqNorm) { foundIndex = i; rec = r; break; }
       if (reqOrderNumber && String(r.orderNumber) === String(reqOrderNumber)) {
-        foundIndex = i;
-        rec = r;
-        break;
+        foundIndex = i; rec = r; break;
       }
     } catch {}
   }
@@ -309,9 +292,7 @@ app.patch('/order-manager/orders/status', requireAdminKey, async (req, res) => {
   if (foundIndex === -1) {
     const sampleNames = [];
     for (let i = 0; i < Math.min(items.length, 5); i++) {
-      try {
-        sampleNames.push(JSON.parse(items[i])?.name);
-      } catch {}
+      try { sampleNames.push(JSON.parse(items[i])?.name); } catch {}
     }
     return res.status(404).json({
       error: 'Order not found',
