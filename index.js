@@ -1,9 +1,11 @@
 require('dotenv').config();
 const express = require('express');
 const crypto = require('crypto');
-const fetch = require('node-fetch').default; // reserved for future use
+const fetch = require('node-fetch').default;
 const { createClient } = require('redis');
 const cors = require('cors');
+const http = require('http');
+const WebSocket = require('ws');
 
 const app = express();
 
@@ -25,6 +27,23 @@ const {
   ORDER_MANAGER_ADMIN_KEY,
 } = process.env;
 
+// ─── Realtime (fast-win) state ────────────────────────────────────────────────
+const clients = new Set();
+let queueRevision = 0;
+
+function broadcastQueueChanged(reason = 'unknown') {
+  queueRevision++;
+  const msg = JSON.stringify({
+    type: 'queue_changed',
+    revision: queueRevision,
+    reason,
+    ts: Date.now(),
+  });
+  for (const ws of clients) {
+    if (ws.readyState === WebSocket.OPEN) ws.send(msg);
+  }
+}
+
 // ─── Helpers ──────────────────────────────────────────────────────────────────
 function verifyShopifyWebhook(req) {
   const hmacHeader = req.get('X-Shopify-Hmac-Sha256');
@@ -32,7 +51,7 @@ function verifyShopifyWebhook(req) {
 
   const computed = crypto
     .createHmac('sha256', SHOPIFY_WEBHOOK_SECRET)
-    .update(req.body, 'utf8')
+    .update(req.body) // Buffer
     .digest('base64');
 
   return crypto.timingSafeEqual(
@@ -115,7 +134,7 @@ function promotedUrlFromPreview(previewUrl, { orderNumber, custSlug, designRef }
 function normalizeName(s) {
   return String(s || '')
     .normalize('NFKC')
-    .replace(/[‐-‒–—―]/g, '-') // any dash variant -> hyphen
+    .replace(/[‐-‒–—―]/g, '-') // dash variants -> hyphen
     .replace(/\s+/g, ' ') // collapse whitespace
     .trim();
 }
@@ -125,14 +144,26 @@ function extractOrderNumberFromName(name) {
   return m ? m[1] : null;
 }
 
+// Shared normalized record shape
+function normalizeRecord(rec) {
+  if (!rec) return rec;
+  if (!rec.status) rec.status = 'received';
+  if (rec.blanksStatus == null) rec.blanksStatus = 0;
+  if (rec.printsStatus == null) rec.printsStatus = 0;
+  if (rec.blanksOrdered == null) rec.blanksOrdered = 0;
+  if (rec.printsOrdered == null) rec.printsOrdered = 0;
+  if (rec.notes == null) rec.notes = '';
+  if (rec.bundle == null) rec.bundle = '';
+  if (!Array.isArray(rec.attachments)) rec.attachments = [];
+  return rec;
+}
+
 // ─── Order Manager API: CORS + Auth ────────────────────────────────────────────
 const UI_ORIGIN = ORDER_MANAGER_UI_ORIGIN || 'https://print-mo-order-manager.pages.dev';
 const ADMIN_KEY = ORDER_MANAGER_ADMIN_KEY;
 
 function requireAdminKey(req, res, next) {
-  // Let CORS preflights through (they won't include your custom header)
   if (req.method === 'OPTIONS') return next();
-
   const key = req.get('X-Order-Manager-Key');
   if (!ADMIN_KEY) return res.status(500).json({ error: 'Missing ORDER_MANAGER_ADMIN_KEY on server' });
   if (!key || key !== ADMIN_KEY) return res.status(401).json({ error: 'Unauthorized' });
@@ -143,20 +174,19 @@ const corsOptions = {
   origin(origin, cb) {
     if (!origin) return cb(null, true); // curl/server-to-server
     if (origin === UI_ORIGIN) return cb(null, true);
-    // allow preview deployments if your origin varies
     if (origin.endsWith('.print-mo-order-manager.pages.dev')) return cb(null, true);
     return cb(new Error('CORS blocked: ' + origin));
   },
-  methods: ['GET', 'PATCH', 'POST', 'OPTIONS'],
+  methods: ['GET', 'PATCH', 'POST', 'DELETE', 'OPTIONS'],
   allowedHeaders: ['Content-Type', 'X-Order-Manager-Key'],
 };
 
-// Apply CORS for all /order-manager requests (this alone is enough to satisfy preflight)
 app.use('/order-manager', cors(corsOptions));
-
-// Parse JSON bodies ONLY for /order-manager routes (so webhook raw body stays intact)
 app.use('/order-manager', express.json({ limit: '2mb' }));
 app.use('/order-manager', express.urlencoded({ extended: true }));
+
+// Optional: if someone hits it via HTTP (not WS), make it obvious
+app.get('/order-manager/ws', (_req, res) => res.status(426).send('Upgrade Required'));
 
 // ─── Webhook ──────────────────────────────────────────────────────────────────
 app.post('/webhooks/orders/paid', express.raw({ type: 'application/json' }), async (req, res) => {
@@ -165,7 +195,6 @@ app.post('/webhooks/orders/paid', express.raw({ type: 'application/json' }), asy
 
   const order = JSON.parse(req.body.toString());
 
-  // Order context
   const orderNumber =
     String(order.order_number || order.name || order.id || '').replace('#', '') || 'order';
 
@@ -174,20 +203,17 @@ app.post('/webhooks/orders/paid', express.raw({ type: 'application/json' }), asy
   const customerName = `${first} ${last}`.trim() || 'Guest';
   const custSlug = slug(customerName || 'customer');
 
-  // Price fields
   const subtotal = parseFloat(order.current_subtotal_price || order.subtotal_price || 0) || 0;
   const discount = parseFloat(order.total_discounts || order.current_total_discounts || 0) || 0;
   const total = parseFloat(order.total_price || order.current_total_price || 0) || 0;
 
   let derivedAssets = 0;
 
-  // Map every line_item and attach a promoted orders URL derived from preview URL
   const items = (order.line_items || []).map(li => {
     const unitPrice = parseFloat(li.price || '0') || 0;
     const qty = li.quantity || 0;
     const props = propertiesToMap(li);
 
-    // designRef in properties (support both keys)
     const designRef = (props['_designref'] || props['_design_ref'] || '').toString().trim();
     const previewUrl = (props['design_preview_url'] || props['design-preview-url'] || '')
       .toString()
@@ -220,8 +246,7 @@ app.post('/webhooks/orders/paid', express.raw({ type: 'application/json' }), asy
     };
   });
 
-  // Build the enriched record
-  const record = {
+  const record = normalizeRecord({
     name: `${order.name} – ${customerName}`,
     orderNumber,
     customerSlug: custSlug,
@@ -231,10 +256,11 @@ app.post('/webhooks/orders/paid', express.raw({ type: 'application/json' }), asy
     total,
     items,
     status: 'received',
-  };
+  });
 
-  // Push to Redis
   await redis.rPush(QUEUE_KEY, JSON.stringify(record));
+  broadcastQueueChanged('new_order');
+
   console.log(`📥 Queued ${record.name} (subtotal $${subtotal.toFixed(2)}), assets derived: ${derivedAssets}`);
   res.status(200).send('Queued');
 });
@@ -242,12 +268,7 @@ app.post('/webhooks/orders/paid', express.raw({ type: 'application/json' }), asy
 // ─── Order Manager Endpoints (UI-facing) ───────────────────────────────────────
 const ALLOWED_STATUSES = new Set(['received', 'toOrder', 'blanks', 'print']);
 
-function normalizeRecord(rec) {
-  if (!rec.status) rec.status = 'received';
-  return rec;
-}
-
-app.get('/order-manager/queue', requireAdminKey, async (req, res) => {
+app.get('/order-manager/queue', requireAdminKey, async (_req, res) => {
   const items = await redis.lRange(QUEUE_KEY, 0, -1);
   const orders = [];
   for (const s of items) {
@@ -278,7 +299,7 @@ app.patch('/order-manager/orders/status', requireAdminKey, async (req, res) => {
 
   for (let i = 0; i < items.length; i++) {
     try {
-      const r = JSON.parse(items[i]);
+      const r = normalizeRecord(JSON.parse(items[i]));
       if (!r) continue;
 
       if (r.name === name) { foundIndex = i; rec = r; break; }
@@ -306,6 +327,8 @@ app.patch('/order-manager/orders/status', requireAdminKey, async (req, res) => {
 
   rec.status = status;
   await redis.lSet(QUEUE_KEY, foundIndex, JSON.stringify(rec));
+  broadcastQueueChanged('status');
+
   res.json({ ok: true });
 });
 
@@ -321,18 +344,6 @@ function asInt01(v, fallback = 0) {
 function asString(v, fallback = '') {
   if (v === null || v === undefined) return fallback;
   return String(v);
-}
-
-function normalizeRecord(rec) {
-  if (!rec.status) rec.status = 'received';
-  if (rec.blanksStatus == null) rec.blanksStatus = 0;
-  if (rec.printsStatus == null) rec.printsStatus = 0;
-  if (rec.blanksOrdered == null) rec.blanksOrdered = 0;
-  if (rec.printsOrdered == null) rec.printsOrdered = 0;
-  if (rec.notes == null) rec.notes = '';
-  if (rec.bundle == null) rec.bundle = '';
-  if (!Array.isArray(rec.attachments)) rec.attachments = []; // metadata only for now
-  return rec;
 }
 
 async function withOrderByName(name, mutatorFn) {
@@ -360,17 +371,26 @@ async function withOrderByName(name, mutatorFn) {
     for (let i = 0; i < Math.min(items.length, 5); i++) {
       try { sampleNames.push(JSON.parse(items[i])?.name); } catch {}
     }
-    return { ok: false, status: 404, body: { error: 'Order not found', queueLength: items.length, requestedName: name, sampleNames: sampleNames.filter(Boolean) } };
+    return {
+      ok: false,
+      status: 404,
+      body: {
+        error: 'Order not found',
+        queueLength: items.length,
+        requestedName: name,
+        sampleNames: sampleNames.filter(Boolean),
+      }
+    };
   }
 
-  // mutate + save
   mutatorFn(rec);
   normalizeRecord(rec);
+
   await redis.lSet(QUEUE_KEY, foundIndex, JSON.stringify(rec));
+  broadcastQueueChanged('order_mutation');
+
   return { ok: true, status: 200, body: { ok: true } };
 }
-
-// ---- Endpoints: Notes, Bundle, Ready/Progress, Rename, Delete ----
 
 // Notes
 app.patch('/order-manager/orders/notes', requireAdminKey, async (req, res) => {
@@ -384,7 +404,7 @@ app.patch('/order-manager/orders/notes', requireAdminKey, async (req, res) => {
   return res.status(result.status).json(result.body);
 });
 
-// Bundle (set or clear)
+// Bundle
 app.patch('/order-manager/orders/bundle', requireAdminKey, async (req, res) => {
   const { name, bundle } = req.body || {};
   if (typeof name !== 'string' || !name.trim()) return res.status(400).json({ error: 'Missing name' });
@@ -396,7 +416,7 @@ app.patch('/order-manager/orders/bundle', requireAdminKey, async (req, res) => {
   return res.status(result.status).json(result.body);
 });
 
-// Ready flags (the checkboxes / header state)
+// Ready flags
 app.patch('/order-manager/orders/ready', requireAdminKey, async (req, res) => {
   const { name, blanksStatus, printsStatus, blanksOrdered, printsOrdered } = req.body || {};
   if (typeof name !== 'string' || !name.trim()) return res.status(400).json({ error: 'Missing name' });
@@ -411,7 +431,7 @@ app.patch('/order-manager/orders/ready', requireAdminKey, async (req, res) => {
   return res.status(result.status).json(result.body);
 });
 
-// Progress (generic numeric field; if your UI calls updateProgress)
+// Progress
 app.patch('/order-manager/orders/progress', requireAdminKey, async (req, res) => {
   const { name, progress } = req.body || {};
   if (typeof name !== 'string' || !name.trim()) return res.status(400).json({ error: 'Missing name' });
@@ -423,7 +443,7 @@ app.patch('/order-manager/orders/progress', requireAdminKey, async (req, res) =>
   return res.status(result.status).json(result.body);
 });
 
-// Rename (careful: your UI uses name as identity; only use if you really need it)
+// Rename
 app.patch('/order-manager/orders/rename', requireAdminKey, async (req, res) => {
   const { name, newName } = req.body || {};
   if (typeof name !== 'string' || !name.trim()) return res.status(400).json({ error: 'Missing name' });
@@ -450,7 +470,7 @@ app.post('/order-manager/orders/delete', requireAdminKey, async (req, res) => {
 
   for (let i = 0; i < items.length; i++) {
     try {
-      const r = JSON.parse(items[i]);
+      const r = normalizeRecord(JSON.parse(items[i]));
       if (!r) continue;
 
       if (r.name === name) { foundIndex = i; break; }
@@ -461,7 +481,9 @@ app.post('/order-manager/orders/delete', requireAdminKey, async (req, res) => {
 
   if (foundIndex === -1) return res.status(404).json({ error: 'Order not found' });
 
-  await redis.lRem(QUEUE_KEY, 1, items[foundIndex]); // remove first matching serialized entry
+  await redis.lRem(QUEUE_KEY, 1, items[foundIndex]);
+  broadcastQueueChanged('delete');
+
   return res.json({ ok: true });
 });
 
@@ -531,7 +553,6 @@ app.post('/order-manager/orders/process-batch', requireAdminKey, async (req, res
         throw new Error(`S&S product lookup failed for ${sku}: ${r.status} ${JSON.stringify(js)}`);
       }
 
-      // S&S may return an array; pricing fields vary by endpoint/version
       const p = Array.isArray(js) ? js[0] : js;
 
       const raw =
@@ -542,7 +563,6 @@ app.post('/order-manager/orders/process-batch', requireAdminKey, async (req, res
         p?.Price ?? p?.price ??
         null;
 
-      // Handles weird values like "12.31T00:00:00" by parsing the leading number
       const parsed = raw == null ? NaN : parseFloat(String(raw));
 
       if (Number.isFinite(parsed)) {
@@ -592,20 +612,57 @@ app.post('/order-manager/orders/process-batch', requireAdminKey, async (req, res
       throw new Error(`Batch failed: ${JSON.stringify(json)}`);
     }
 
+    broadcastQueueChanged('process_batch');
+
     return res.json({
       ok: true,
       orderNumber: created.orderNumber,
       count: toProcess.length,
       subtotal: Number(subtotal.toFixed(2)),
       skuCount: skus.length,
-      priceWarnings, // optional debug info; can remove later
+      priceWarnings,
     });
   } catch (err) {
     return res.status(500).json({ error: err?.message || String(err) });
   }
 });
 
-
-// ─── Start server ──────────────────────────────────────────────────────────────
+// ─── Start server + WebSocket upgrade handling ────────────────────────────────
 const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => console.log(`Listening on port ${PORT}`));
+const server = http.createServer(app);
+
+const wss = new WebSocket.Server({ noServer: true });
+
+server.on('upgrade', (req, socket, head) => {
+  const u = new URL(req.url, 'http://localhost'); // don't trust req.headers.host through proxies
+  if (u.pathname !== '/order-manager/ws') {
+    socket.destroy();
+    return;
+  }
+
+  // Fast-win security: require the same header your worker injects
+  const got = Array.isArray(req.headers['x-order-manager-key'])
+    ? req.headers['x-order-manager-key'][0]
+    : req.headers['x-order-manager-key'];
+
+  const expected = process.env.ORDER_MANAGER_ADMIN_KEY;
+  if (!expected || String(got || '') !== String(expected)) {
+    socket.destroy();
+    return;
+  }
+
+  wss.handleUpgrade(req, socket, head, (ws) => {
+    wss.emit('connection', ws, req);
+  });
+});
+
+wss.on('connection', (ws) => {
+  clients.add(ws);
+
+  ws.send(JSON.stringify({ type: 'hello', revision: queueRevision }));
+
+  ws.on('close', () => clients.delete(ws));
+  ws.on('error', () => clients.delete(ws));
+});
+
+server.listen(PORT, () => console.log(`Listening on port ${PORT}`));
