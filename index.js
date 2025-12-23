@@ -147,7 +147,7 @@ const corsOptions = {
     if (origin.endsWith('.print-mo-order-manager.pages.dev')) return cb(null, true);
     return cb(new Error('CORS blocked: ' + origin));
   },
-  methods: ['GET', 'PATCH', 'OPTIONS'],
+  methods: ['GET', 'PATCH', 'POST', 'OPTIONS'],
   allowedHeaders: ['Content-Type', 'X-Order-Manager-Key'],
 };
 
@@ -465,6 +465,123 @@ app.post('/order-manager/orders/delete', requireAdminKey, async (req, res) => {
   return res.json({ ok: true });
 });
 
+// Submit batch to S&S (server-side)
+app.post('/order-manager/orders/process-batch', requireAdminKey, async (req, res) => {
+  try {
+    const body = req.body || {};
+    const names =
+      (Array.isArray(body.names) && body.names) ||
+      (Array.isArray(body.orderIds) && body.orderIds) ||
+      (Array.isArray(body.ids) && body.ids) ||
+      [];
+
+    if (!names.length) return res.status(400).json({ error: 'No orders to submit' });
+
+    const rawQueue = await redis.lRange(QUEUE_KEY, 0, -1);
+    const orders = rawQueue
+      .map(s => { try { return normalizeRecord(JSON.parse(s)); } catch { return null; } })
+      .filter(Boolean);
+
+    const nameSet = new Set(names);
+    const toProcess = orders.filter(o => nameSet.has(o.name));
+    if (!toProcess.length) return res.status(404).json({ error: 'No matching orders found' });
+
+    // Aggregate SKUs
+    const agg = {};
+    for (const o of toProcess) {
+      for (const it of (o.items || [])) {
+        const sku = it?.sku;
+        const qty = Number(it?.qty || 0);
+        if (!sku || !Number.isFinite(qty) || qty <= 0) continue;
+        agg[sku] = (agg[sku] || 0) + qty;
+      }
+    }
+    const skus = Object.keys(agg);
+    if (!skus.length) return res.status(400).json({ error: 'No SKUs found to submit (missing SKUs on line items?)' });
+
+    const {
+      SS_ACCOUNT_NUMBER,
+      SS_API_KEY,
+      SS_PAYMENT_PROFILE_ID,
+      SS_PAYMENT_PROFILE_EMAIL,
+    } = process.env;
+
+    if (!SS_ACCOUNT_NUMBER || !SS_API_KEY) {
+      return res.status(500).json({ error: 'Missing SS_ACCOUNT_NUMBER or SS_API_KEY on server' });
+    }
+    if (!SS_PAYMENT_PROFILE_ID || !SS_PAYMENT_PROFILE_EMAIL) {
+      return res.status(500).json({ error: 'Missing SS_PAYMENT_PROFILE_ID or SS_PAYMENT_PROFILE_EMAIL on server' });
+    }
+
+    const auth = 'Basic ' + Buffer.from(`${SS_ACCOUNT_NUMBER}:${SS_API_KEY}`).toString('base64');
+
+    // Optional: compute subtotal (same behavior as your Electron code)
+    let subtotal = 0;
+    for (const [sku, qty] of Object.entries(agg)) {
+      const r = await fetch(
+        `https://api.ssactivewear.com/v2/products/${encodeURIComponent(sku)}?mediatype=json`,
+        { headers: { Authorization: auth, Accept: 'application/json' } }
+      );
+      const js = await r.json().catch(() => ({}));
+      if (!r.ok) {
+        throw new Error(`S&S product lookup failed for ${sku}: ${r.status} ${JSON.stringify(js)}`);
+      }
+      const price = (js.Price ?? js.price);
+      if (typeof price !== 'number') throw new Error(`Missing price for SKU ${sku}: ${JSON.stringify(js)}`);
+      subtotal += price * qty;
+    }
+
+    const payload = {
+      customer: `Batch of ${toProcess.length} orders`,
+      testOrder: true,
+      autoSelectWarehouse: true,
+      rejectLineErrors: false,
+      shippingAddress: {
+        Name: 'LoGo Fishin Attn: TJ Reid',
+        Address: '328 Bristlecone Ct S',
+        City: 'Saint Charles',
+        State: 'MO',
+        Zip: '63304',
+        Country: 'USA',
+      },
+      Lines: Object.entries(agg).map(([Identifier, Qty]) => ({ Identifier, Qty })),
+      PaymentProfile: {
+        ProfileID: parseInt(SS_PAYMENT_PROFILE_ID, 10),
+        Email: SS_PAYMENT_PROFILE_EMAIL,
+      },
+    };
+
+    const resp = await fetch('https://api.ssactivewear.com/v2/orders/', {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'Authorization': auth,
+        'Accept': 'application/json',
+      },
+      body: JSON.stringify(payload),
+    });
+
+    const json = await resp.json().catch(() => ({}));
+    if (!resp.ok) {
+      throw new Error(`S&S order create failed: ${resp.status} ${JSON.stringify(json)}`);
+    }
+
+    const created = json.orders?.[0];
+    if (!created?.orderNumber) {
+      throw new Error(`Batch failed: ${JSON.stringify(json)}`);
+    }
+
+    return res.json({
+      ok: true,
+      orderNumber: created.orderNumber,
+      count: toProcess.length,
+      subtotal: Number(subtotal.toFixed(2)),
+      skuCount: skus.length,
+    });
+  } catch (err) {
+    return res.status(500).json({ error: err?.message || String(err) });
+  }
+});
 
 // ─── Start server ──────────────────────────────────────────────────────────────
 const PORT = process.env.PORT || 3000;
