@@ -471,6 +471,7 @@ app.post('/order-manager/orders/process-batch', requireAdminKey, async (req, res
     const body = req.body || {};
     const names =
       (Array.isArray(body.names) && body.names) ||
+      (Array.isArray(body.orderNames) && body.orderNames) ||
       (Array.isArray(body.orderIds) && body.orderIds) ||
       (Array.isArray(body.ids) && body.ids) ||
       [];
@@ -515,20 +516,40 @@ app.post('/order-manager/orders/process-batch', requireAdminKey, async (req, res
 
     const auth = 'Basic ' + Buffer.from(`${SS_ACCOUNT_NUMBER}:${SS_API_KEY}`).toString('base64');
 
-    // Optional: compute subtotal (same behavior as your Electron code)
+    // Best-effort subtotal: do not hard-fail if pricing fields vary
     let subtotal = 0;
+    const priceWarnings = [];
+
     for (const [sku, qty] of Object.entries(agg)) {
       const r = await fetch(
         `https://api.ssactivewear.com/v2/products/${encodeURIComponent(sku)}?mediatype=json`,
         { headers: { Authorization: auth, Accept: 'application/json' } }
       );
+
       const js = await r.json().catch(() => ({}));
       if (!r.ok) {
         throw new Error(`S&S product lookup failed for ${sku}: ${r.status} ${JSON.stringify(js)}`);
       }
-      const price = (js.Price ?? js.price);
-      if (typeof price !== 'number') throw new Error(`Missing price for SKU ${sku}: ${JSON.stringify(js)}`);
-      subtotal += price * qty;
+
+      // S&S may return an array; pricing fields vary by endpoint/version
+      const p = Array.isArray(js) ? js[0] : js;
+
+      const raw =
+        p?.customerPrice ?? p?.CustomerPrice ??
+        p?.piecePrice ?? p?.PiecePrice ??
+        p?.salePrice ?? p?.SalePrice ??
+        p?.casePrice ?? p?.CasePrice ??
+        p?.Price ?? p?.price ??
+        null;
+
+      // Handles weird values like "12.31T00:00:00" by parsing the leading number
+      const parsed = raw == null ? NaN : parseFloat(String(raw));
+
+      if (Number.isFinite(parsed)) {
+        subtotal += parsed * qty;
+      } else {
+        priceWarnings.push({ sku, raw });
+      }
     }
 
     const payload = {
@@ -577,11 +598,13 @@ app.post('/order-manager/orders/process-batch', requireAdminKey, async (req, res
       count: toProcess.length,
       subtotal: Number(subtotal.toFixed(2)),
       skuCount: skus.length,
+      priceWarnings, // optional debug info; can remove later
     });
   } catch (err) {
     return res.status(500).json({ error: err?.message || String(err) });
   }
 });
+
 
 // ─── Start server ──────────────────────────────────────────────────────────────
 const PORT = process.env.PORT || 3000;
