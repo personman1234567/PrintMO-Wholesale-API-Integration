@@ -6,6 +6,7 @@ const { createClient } = require('redis');
 const cors = require('cors');
 const http = require('http');
 const WebSocket = require('ws');
+const { createPhase2Data } = require('./phase2-data');
 
 const app = express();
 
@@ -47,17 +48,17 @@ function broadcastQueueChanged(reason = 'unknown') {
 // ─── Helpers ──────────────────────────────────────────────────────────────────
 function verifyShopifyWebhook(req) {
   const hmacHeader = req.get('X-Shopify-Hmac-Sha256');
-  if (!hmacHeader) return true; // allow local testing
+  if (!hmacHeader || !SHOPIFY_WEBHOOK_SECRET) return false;
 
   const computed = crypto
     .createHmac('sha256', SHOPIFY_WEBHOOK_SECRET)
     .update(req.body) // Buffer
     .digest('base64');
 
-  return crypto.timingSafeEqual(
-    Buffer.from(computed, 'utf8'),
-    Buffer.from(hmacHeader, 'utf8')
-  );
+  const computedBytes = Buffer.from(computed, 'utf8');
+  const headerBytes = Buffer.from(hmacHeader, 'utf8');
+  return computedBytes.length === headerBytes.length
+    && crypto.timingSafeEqual(computedBytes, headerBytes);
 }
 
 function slug(s) {
@@ -185,6 +186,9 @@ app.use('/order-manager', cors(corsOptions));
 app.use('/order-manager', express.json({ limit: '2mb' }));
 app.use('/order-manager', express.urlencoded({ extended: true }));
 
+const phase2Data = createPhase2Data({ redis, broadcastQueueChanged });
+app.use('/order-manager/v1', requireAdminKey, phase2Data.router);
+
 // Optional: if someone hits it via HTTP (not WS), make it obvious
 app.get('/order-manager/ws', (_req, res) => res.status(426).send('Upgrade Required'));
 
@@ -247,6 +251,7 @@ app.post('/webhooks/orders/paid', express.raw({ type: 'application/json' }), asy
   });
 
   const record = normalizeRecord({
+    admin_graphql_api_id: order.admin_graphql_api_id || (order.id ? `gid://shopify/Order/${order.id}` : null),
     name: `${order.name} – ${customerName}`,
     orderNumber,
     customerSlug: custSlug,
@@ -258,11 +263,14 @@ app.post('/webhooks/orders/paid', express.raw({ type: 'application/json' }), asy
     status: 'received',
   });
 
-  await redis.rPush(QUEUE_KEY, JSON.stringify(record));
-  broadcastQueueChanged('new_order');
+  const inserted = await phase2Data.appendLegacyOrderIfMissing(record);
+  if (inserted) {
+    phase2Data.projectMappedLegacyOrder(record).catch(err => console.error('Shadow projection error:', err.message));
+    broadcastQueueChanged('new_order');
+  }
 
-  console.log(`📥 Queued ${record.name} (subtotal $${subtotal.toFixed(2)}), assets derived: ${derivedAssets}`);
-  res.status(200).send('Queued');
+  console.log(`${inserted ? '📥 Queued' : '↩️ Already queued'} ${record.name} (subtotal $${subtotal.toFixed(2)}), assets derived: ${derivedAssets}`);
+  res.status(200).send(inserted ? 'Queued' : 'Already queued');
 });
 
 // ─── Order Manager Endpoints (UI-facing) ───────────────────────────────────────
@@ -327,6 +335,7 @@ app.patch('/order-manager/orders/status', requireAdminKey, async (req, res) => {
 
   rec.status = status;
   await redis.lSet(QUEUE_KEY, foundIndex, JSON.stringify(rec));
+  phase2Data.projectMappedLegacyOrder(rec).catch(err => console.error('Shadow projection error:', err.message));
   broadcastQueueChanged('status');
 
   res.json({ ok: true });
@@ -387,6 +396,7 @@ async function withOrderByName(name, mutatorFn) {
   normalizeRecord(rec);
 
   await redis.lSet(QUEUE_KEY, foundIndex, JSON.stringify(rec));
+  phase2Data.projectMappedLegacyOrder(rec).catch(err => console.error('Shadow projection error:', err.message));
   broadcastQueueChanged('order_mutation');
 
   return { ok: true, status: 200, body: { ok: true } };
