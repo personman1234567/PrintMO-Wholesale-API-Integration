@@ -79,10 +79,71 @@ local allowed = {
   blanks_status=true, prints_status=true, prints_ordered=true, blanks_po=true,
   assets=true, production_snapshot=true, archived_at=true, archived_by=true
 }
+local mirrorsLegacy = false
 for field, value in pairs(patch) do
   if not allowed[field] then
     return cjson.encode({ok = false, code = 'INVALID_FIELD', field = field})
   end
+  if field == 'stage' or field == 'bundle_id' or field == 'internal_notes'
+    or field == 'printed_count' or field == 'blanks_status'
+    or field == 'prints_status' or field == 'prints_ordered' then
+    mirrorsLegacy = true
+  end
+end
+
+if patch.stage == 'completed' then
+  return cjson.encode({ok = false, code = 'LEGACY_STAGE_UNSUPPORTED', field = 'stage'})
+end
+
+local legacyIndex = nil
+local legacyOrder = nil
+if mirrorsLegacy then
+  local gid = ARGV[4]
+  local legacyIdentifier = redis.call('HGET', KEYS[1], 'legacy_identifier') or ''
+  local raw = redis.call('LRANGE', KEYS[6], 0, -1)
+  for index, value in ipairs(raw) do
+    local decoded, order = pcall(cjson.decode, value)
+    if decoded then
+      local orderName = tostring(order.name or '')
+      local orderNumber = tostring(order.orderNumber or order.id or '')
+      local numberFromName = string.match(orderName, '#?(%d+)') or ''
+      if (order.admin_graphql_api_id and tostring(order.admin_graphql_api_id) == gid)
+        or (legacyIdentifier ~= '' and (
+          orderName == legacyIdentifier
+          or orderNumber == legacyIdentifier
+          or numberFromName == legacyIdentifier
+        )) then
+        legacyIndex = index - 1
+        legacyOrder = order
+        break
+      end
+    end
+  end
+  if legacyIndex == nil then
+    return cjson.encode({ok = false, code = 'LEGACY_ORDER_NOT_FOUND'})
+  end
+
+  if patch.stage ~= nil then
+    if patch.stage == 'received' then legacyOrder.status = 'received'
+    elseif patch.stage == 'to_order' then legacyOrder.status = 'toOrder'
+    elseif patch.stage == 'blanks_cart' then
+      legacyOrder.status = 'blanks'
+      legacyOrder.blanksOrdered = 0
+    elseif patch.stage == 'blanks_ordered' then
+      legacyOrder.status = 'blanks'
+      legacyOrder.blanksOrdered = 1
+    elseif patch.stage == 'print' then legacyOrder.status = 'print'
+    end
+  end
+  if patch.bundle_id ~= nil then legacyOrder.bundle = patch.bundle_id == cjson.null and '' or patch.bundle_id end
+  if patch.internal_notes ~= nil then legacyOrder.notes = patch.internal_notes == cjson.null and '' or patch.internal_notes end
+  if patch.printed_count ~= nil then legacyOrder.progress = patch.printed_count == cjson.null and 0 or tonumber(patch.printed_count) end
+  if patch.blanks_status ~= nil then legacyOrder.blanksStatus = patch.blanks_status == cjson.null and 0 or tonumber(patch.blanks_status) end
+  if patch.prints_status ~= nil then legacyOrder.printsStatus = patch.prints_status == cjson.null and 0 or tonumber(patch.prints_status) end
+  if patch.prints_ordered ~= nil then legacyOrder.printsOrdered = patch.prints_ordered == cjson.null and 0 or tonumber(patch.prints_ordered) end
+end
+
+for field, value in pairs(patch) do
   if value == cjson.null then redis.call('HDEL', KEYS[1], field)
   elseif type(value) == 'table' then redis.call('HSET', KEYS[1], field, cjson.encode(value))
   else redis.call('HSET', KEYS[1], field, tostring(value)) end
@@ -97,7 +158,8 @@ if ARGV[5] == '1' then
 else
   redis.call('ZREM', KEYS[4], ARGV[4])
 end
-local result = cjson.encode({ok = true, version = newVersion})
+if legacyIndex ~= nil then redis.call('LSET', KEYS[6], legacyIndex, cjson.encode(legacyOrder)) end
+local result = cjson.encode({ok = true, version = newVersion, mirroredLegacy = legacyIndex ~= nil})
 redis.call('SET', KEYS[5], result, 'EX', 86400)
 return result`;
 
@@ -468,7 +530,8 @@ function createPhase2Data({ redis, broadcastQueueChanged = () => {} }) {
       `${prefix}:active_orders`,
       `${prefix}:stage:${oldStage}`,
       `${prefix}:stage:${newStage}`,
-      `${prefix}:idempotency:${id}:${digest(idempotencyKey)}`
+      `${prefix}:idempotency:${id}:${digest(idempotencyKey)}`,
+      QUEUE_KEY
     ];
     const raw = await redis.eval(MUTATE_PRODUCTION_LUA, {
       keys,
@@ -489,7 +552,13 @@ function createPhase2Data({ redis, broadcastQueueChanged = () => {} }) {
       timestamp: new Date().toISOString(),
       outcome: 'success'
     });
-    res.json({ ok: true, version: result.version, production: metadataFromHash(await redis.hGetAll(keys[0])) });
+    if (result.mirroredLegacy) broadcastQueueChanged('v1_production_mutation');
+    res.json({
+      ok: true,
+      version: result.version,
+      mirroredLegacy: Boolean(result.mirroredLegacy),
+      production: metadataFromHash(await redis.hGetAll(keys[0]))
+    });
   });
 
   router.post('/data/cache/summaries', async (req, res) => {
@@ -561,13 +630,26 @@ function createPhase2Data({ redis, broadcastQueueChanged = () => {} }) {
     const orders = await readQueue();
     const prefix = prefixFor(shop);
     const mismatches = [];
+    const explainedQuarantines = [];
+    const quarantineRecords = (await redis.sMembers(`${prefix}:quarantine`)).flatMap(value => {
+      try { return [JSON.parse(value)]; } catch { return []; }
+    });
+    const quarantinedIdentifiers = new Set(quarantineRecords.map(record => {
+      const match = /(\d+)/.exec(String(record.legacyIdentifier || ''));
+      return match ? match[1] : String(record.legacyIdentifier || '');
+    }).filter(Boolean));
     const mappedLegacyGids = new Set();
     let matched = 0;
     for (const legacy of orders) {
       const gid = await resolveLegacyGid(shop, legacy);
       const identifier = legacy.orderNumber || String(legacy.name || '').split(/[–-]/)[0].trim() || 'unknown';
       if (!gid) {
-        mismatches.push({ orderIdentifier: identifier, fields: ['mapping'], reason: 'UNMAPPED_LEGACY_ORDER' });
+        const normalizedIdentifier = /(\d+)/.exec(String(identifier))?.[1] || String(identifier);
+        if (quarantinedIdentifiers.has(normalizedIdentifier)) {
+          explainedQuarantines.push({ orderIdentifier: identifier, reason: 'APPROVED_QUARANTINE' });
+        } else {
+          mismatches.push({ orderIdentifier: identifier, fields: ['mapping'], reason: 'UNMAPPED_LEGACY_ORDER' });
+        }
         continue;
       }
       const id = numericOrderId(gid);
@@ -607,6 +689,8 @@ function createPhase2Data({ redis, broadcastQueueChanged = () => {} }) {
       checkedAt: new Date().toISOString(),
       legacyTotalCount: orders.length,
       v1MatchedCount: matched,
+      explainedQuarantineCount: explainedQuarantines.length,
+      explainedQuarantines,
       unexplainedMismatchCount: mismatches.length,
       mismatches,
       parityStatus: mismatches.length ? 'MISMATCH' : 'PASSED'

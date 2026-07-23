@@ -22,6 +22,7 @@ class FakeRedis {
   async get(key) { return this.strings.get(key) || null; }
   async set(key, value) { this.strings.set(key, String(value)); return 'OK'; }
   async sAdd(key, values) { const set = this.sets.get(key) || new Set(); for (const value of Array.isArray(values) ? values : [values]) set.add(value); this.sets.set(key, set); return 1; }
+  async sMembers(key) { return [...(this.sets.get(key) || new Set())]; }
   async sRem(key, value) { return this.sets.get(key)?.delete(value) ? 1 : 0; }
   async zAdd(key, entries) { const set = this.zsets.get(key) || new Map(); for (const entry of entries) set.set(entry.value, entry.score); this.zsets.set(key, set); return entries.length; }
   async zRem(key, value) { return this.zsets.get(key)?.delete(value) ? 1 : 0; }
@@ -53,6 +54,11 @@ async function run() {
   const adapterSource = fs.readFileSync(require.resolve('../phase2-data'), 'utf8');
   assert(adapterSource.indexOf("local prior = redis.call('GET', KEYS[5])") < adapterSource.indexOf('local current = tonumber'), 'idempotent retries must be resolved before version conflicts');
   assert(adapterSource.includes('`${prefix}:idempotency:${id}:${digest(idempotencyKey)}`'), 'idempotency keys must be scoped to an order');
+  assert(adapterSource.includes("code = 'LEGACY_ORDER_NOT_FOUND'"), 'legacy-compatible writes must fail before changing v1 when the legacy order is missing');
+  assert(adapterSource.includes("code = 'LEGACY_STAGE_UNSUPPORTED'"), 'completed stage must be rejected while the legacy board cannot represent it');
+  assert(adapterSource.includes("redis.call('LSET', KEYS[6]"), 'production metadata and the legacy queue must be written in the same Redis script');
+  assert(adapterSource.includes("numberFromName == legacyIdentifier"), 'legacy mirroring must support the deployed queue shape that lacks Shopify GIDs');
+  assert(adapterSource.includes("broadcastQueueChanged('v1_production_mutation')"), 'mirrored production mutations must notify connected clients');
 
   const redis = new FakeRedis();
   const shop = 'printmo-test.myshopify.com';
@@ -95,6 +101,7 @@ async function run() {
   const report = await data.runParity(shop);
   assert.equal(report.parityStatus, 'PASSED');
   assert.equal(report.unexplainedMismatchCount, 0);
+  assert.equal(report.explainedQuarantineCount, 0);
   assert.equal(canonicalStage({ status: 'blanks', blanksOrdered: 0 }), 'blanks_cart');
   assert.equal(canonicalStage({ status: 'print' }), 'print');
   console.log('Render Phase 2 Redis adapter verification passed.');
