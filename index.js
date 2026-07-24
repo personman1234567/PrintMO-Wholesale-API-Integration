@@ -186,6 +186,46 @@ app.use('/order-manager', cors(corsOptions));
 app.use('/order-manager', express.json({ limit: '2mb' }));
 app.use('/order-manager', express.urlencoded({ extended: true }));
 
+// Redis-free supplier gateway. The Cloudflare data plane owns batch state and
+// sends only a validated, aggregate S&S request to this endpoint.
+app.post('/order-manager/v1/supplier/ss/commit', requireAdminKey, async (req, res) => {
+  try {
+    const body = req.body || {};
+    const lines = Array.isArray(body.lines) ? body.lines : [];
+    if (!body.batchId || typeof body.batchId !== 'string') {
+      return res.status(400).json({ error: 'batchId is required' });
+    }
+    if (!lines.length || lines.length > 500) {
+      return res.status(400).json({ error: 'lines must contain between 1 and 500 S&S SKUs' });
+    }
+    const aggregate = {};
+    for (const line of lines) {
+      const sku = String(line?.sku || line?.Identifier || '').trim();
+      const qty = Number(line?.qty ?? line?.Qty);
+      if (!/^[A-Za-z0-9._-]{1,80}$/.test(sku) || !Number.isInteger(qty) || qty <= 0 || qty > 100000) {
+        return res.status(400).json({ error: `Invalid supplier line: ${sku || '(missing SKU)'}` });
+      }
+      aggregate[sku] = (aggregate[sku] || 0) + qty;
+    }
+
+    const result = await submitSsOrder({
+      aggregate,
+      orderCount: Math.max(1, Number(body.orderCount) || 1),
+      purchaseOrder: String(body.poNumber || body.batchId).slice(0, 50),
+      testOrder: body.testOrder !== false,
+    });
+    return res.json({
+      ok: true,
+      batchId: body.batchId,
+      requestHash: body.lineHash || null,
+      ...result,
+    });
+  } catch (error) {
+    console.error('Redis-free S&S commit failed:', error);
+    return res.status(error?.status || 502).json({ error: error?.message || String(error) });
+  }
+});
+
 const phase2Data = createPhase2Data({ redis, broadcastQueueChanged });
 app.use('/order-manager/v1', requireAdminKey, phase2Data.router);
 
@@ -498,6 +538,100 @@ app.post('/order-manager/orders/delete', requireAdminKey, async (req, res) => {
 });
 
 // Submit batch to S&S (server-side)
+async function submitSsOrder({ aggregate, orderCount, purchaseOrder, testOrder = true }) {
+  const skus = Object.keys(aggregate || {});
+  if (!skus.length) throw Object.assign(new Error('No SKUs found to submit'), { status: 400 });
+
+  const {
+    SS_ACCOUNT_NUMBER,
+    SS_API_KEY,
+    SS_PAYMENT_PROFILE_ID,
+    SS_PAYMENT_PROFILE_EMAIL,
+  } = process.env;
+  if (!SS_ACCOUNT_NUMBER || !SS_API_KEY) {
+    throw Object.assign(new Error('Missing SS_ACCOUNT_NUMBER or SS_API_KEY on server'), { status: 500 });
+  }
+  if (!SS_PAYMENT_PROFILE_ID || !SS_PAYMENT_PROFILE_EMAIL) {
+    throw Object.assign(new Error('Missing SS_PAYMENT_PROFILE_ID or SS_PAYMENT_PROFILE_EMAIL on server'), { status: 500 });
+  }
+
+  const auth = 'Basic ' + Buffer.from(`${SS_ACCOUNT_NUMBER}:${SS_API_KEY}`).toString('base64');
+  let subtotal = 0;
+  const priceWarnings = [];
+  for (const [sku, qty] of Object.entries(aggregate)) {
+    const response = await fetch(
+      `https://api.ssactivewear.com/v2/products/${encodeURIComponent(sku)}?mediatype=json`,
+      { headers: { Authorization: auth, Accept: 'application/json' } }
+    );
+    const json = await response.json().catch(() => ({}));
+    if (!response.ok) {
+      throw Object.assign(
+        new Error(`S&S product lookup failed for ${sku}: ${response.status} ${JSON.stringify(json)}`),
+        { status: 502 }
+      );
+    }
+    const product = Array.isArray(json) ? json[0] : json;
+    const raw =
+      product?.customerPrice ?? product?.CustomerPrice ??
+      product?.piecePrice ?? product?.PiecePrice ??
+      product?.salePrice ?? product?.SalePrice ??
+      product?.casePrice ?? product?.CasePrice ??
+      product?.Price ?? product?.price ?? null;
+    const parsed = raw == null ? NaN : parseFloat(String(raw));
+    if (Number.isFinite(parsed)) subtotal += parsed * qty;
+    else priceWarnings.push({ sku, raw });
+  }
+
+  const payload = {
+    customer: `${purchaseOrder || 'PrintMO'} · ${orderCount} order${orderCount === 1 ? '' : 's'}`,
+    testOrder: Boolean(testOrder),
+    autoSelectWarehouse: true,
+    rejectLineErrors: false,
+    shippingAddress: {
+      Name: 'LoGo Fishin Attn: TJ Reid',
+      Address: '328 Bristlecone Ct S',
+      City: 'Saint Charles',
+      State: 'MO',
+      Zip: '63304',
+      Country: 'USA',
+    },
+    Lines: Object.entries(aggregate).map(([Identifier, Qty]) => ({ Identifier, Qty })),
+    PaymentProfile: {
+      ProfileID: parseInt(SS_PAYMENT_PROFILE_ID, 10),
+      Email: SS_PAYMENT_PROFILE_EMAIL,
+    },
+  };
+
+  const response = await fetch('https://api.ssactivewear.com/v2/orders/', {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+      Authorization: auth,
+      Accept: 'application/json',
+    },
+    body: JSON.stringify(payload),
+  });
+  const json = await response.json().catch(() => ({}));
+  if (!response.ok) {
+    throw Object.assign(
+      new Error(`S&S order create failed: ${response.status} ${JSON.stringify(json)}`),
+      { status: 502 }
+    );
+  }
+  const created = json.orders?.[0];
+  if (!created?.orderNumber) {
+    throw Object.assign(new Error(`S&S response did not confirm an order: ${JSON.stringify(json)}`), { status: 502 });
+  }
+  return {
+    orderNumber: created.orderNumber,
+    count: orderCount,
+    subtotal: Number(subtotal.toFixed(2)),
+    skuCount: skus.length,
+    priceWarnings,
+    testOrder: Boolean(testOrder),
+  };
+}
+
 app.post('/order-manager/orders/process-batch', requireAdminKey, async (req, res) => {
   try {
     const body = req.body || {};

@@ -51,6 +51,10 @@ class FakeRedis {
 async function run() {
   const serverSource = fs.readFileSync(require.resolve('../index'), 'utf8');
   assert(!serverSource.includes('if (!hmacHeader) return true'), 'legacy Shopify webhook verification must fail closed');
+  const supplierRoute = serverSource.match(/app\.post\('\/order-manager\/v1\/supplier\/ss\/commit'[\s\S]*?\n\}\);/);
+  assert(supplierRoute, 'Redis-free S&S supplier commit endpoint must exist');
+  assert(!supplierRoute[0].includes('redis.'), 'the candidate S&S supplier gateway must not read or write Redis');
+  assert(supplierRoute[0].includes('submitSsOrder'), 'the candidate gateway must validate lines before calling S&S');
   const adapterSource = fs.readFileSync(require.resolve('../phase2-data'), 'utf8');
   assert(adapterSource.indexOf("local prior = redis.call('GET', KEYS[5])") < adapterSource.indexOf('local current = tonumber'), 'idempotent retries must be resolved before version conflicts');
   assert(adapterSource.includes('`${prefix}:idempotency:${id}:${digest(idempotencyKey)}`'), 'idempotency keys must be scoped to an order');
