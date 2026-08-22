@@ -7,6 +7,7 @@ const cors = require('cors');
 const http = require('http');
 const WebSocket = require('ws');
 const { createPhase2Data } = require('./phase2-data');
+const { normalizeSsOrderResponse, supplierError, supplierMessage } = require('./supplier-response');
 
 const app = express();
 
@@ -222,7 +223,8 @@ app.post('/order-manager/v1/supplier/ss/commit', requireAdminKey, async (req, re
     });
   } catch (error) {
     console.error('Redis-free S&S commit failed:', error);
-    return res.status(error?.status || 502).json({ error: error?.message || String(error) });
+    const status = Number(error?.status) || 502;
+    return res.status(status).json(error?.body || { error: { message: error?.message || String(error) } });
   }
 });
 
@@ -558,17 +560,23 @@ async function submitSsOrder({ aggregate, orderCount, purchaseOrder, testOrder =
   const auth = 'Basic ' + Buffer.from(`${SS_ACCOUNT_NUMBER}:${SS_API_KEY}`).toString('base64');
   let subtotal = 0;
   const priceWarnings = [];
-  for (const [sku, qty] of Object.entries(aggregate)) {
+  for (const [lineIndex, [sku, qty]] of Object.entries(aggregate).entries()) {
     const response = await fetch(
       `https://api.ssactivewear.com/v2/products/${encodeURIComponent(sku)}?mediatype=json`,
       { headers: { Authorization: auth, Accept: 'application/json' } }
     );
     const json = await response.json().catch(() => ({}));
     if (!response.ok) {
-      throw Object.assign(
-        new Error(`S&S product lookup failed for ${sku}: ${response.status} ${JSON.stringify(json)}`),
-        { status: 502 }
-      );
+      const fallback = `S&S product lookup failed for ${sku} (HTTP ${response.status}).`;
+      throw supplierError(response.status, {
+        LineErrors: [{
+          Identifier: sku,
+          Field: `lines[${lineIndex}].identifier`,
+          Code: 'PRODUCT_LOOKUP_FAILED',
+          Message: supplierMessage(json, fallback),
+          RequestedQty: qty,
+        }],
+      }, fallback);
     }
     const product = Array.isArray(json) ? json[0] : json;
     const raw =
@@ -612,18 +620,15 @@ async function submitSsOrder({ aggregate, orderCount, purchaseOrder, testOrder =
     body: JSON.stringify(payload),
   });
   const json = await response.json().catch(() => ({}));
-  if (!response.ok) {
-    throw Object.assign(
-      new Error(`S&S order create failed: ${response.status} ${JSON.stringify(json)}`),
-      { status: 502 }
-    );
-  }
-  const created = json.orders?.[0];
-  if (!created?.orderNumber) {
-    throw Object.assign(new Error(`S&S response did not confirm an order: ${JSON.stringify(json)}`), { status: 502 });
+  if (!response.ok) throw supplierError(response.status, json, `S&S rejected the order request (HTTP ${response.status}).`);
+  const safeResponse = normalizeSsOrderResponse(json, aggregate);
+  const created = safeResponse.Orders.find(order => order.OrderNumber);
+  if (!created?.OrderNumber && safeResponse.outcome === 'unknown') {
+    throw supplierError(502, json, 'S&S did not confirm whether an order was created.');
   }
   return {
-    orderNumber: created.orderNumber,
+    ...safeResponse,
+    orderNumber: created?.OrderNumber || null,
     count: orderCount,
     subtotal: Number(subtotal.toFixed(2)),
     skuCount: skus.length,

@@ -2,6 +2,7 @@ const assert = require('assert');
 const crypto = require('crypto');
 const fs = require('fs');
 const { createPhase2Data, canonicalStage } = require('../phase2-data');
+const { normalizeSsOrderResponse, supplierError } = require('../supplier-response');
 
 class FakeRedis {
   constructor() {
@@ -55,6 +56,48 @@ async function run() {
   assert(supplierRoute, 'Redis-free S&S supplier commit endpoint must exist');
   assert(!supplierRoute[0].includes('redis.'), 'the candidate S&S supplier gateway must not read or write Redis');
   assert(supplierRoute[0].includes('submitSsOrder'), 'the candidate gateway must validate lines before calling S&S');
+  assert(supplierRoute[0].includes('error?.body'), 'structured supplier errors must be forwarded to the Worker');
+
+  const partialSupplierResponse = normalizeSsOrderResponse({
+    Orders: [{
+      OrderNumber: 'SS-TEST-1001',
+      Lines: [{ Identifier: '5000-BLACK-M', QtyOrdered: 2, CustomerPrice: 3.25 }],
+      ShippingAddress: { Name: 'Must not leave gateway' },
+    }],
+    LineErrors: [{
+      Identifier: '1717-BLUEJEAN-L',
+      Code: 'NO_STOCK',
+      Message: 'No inventory is available for this SKU.',
+      RequestedQty: 1,
+      AvailableQty: 0,
+      InternalDetail: 'Must not leave gateway',
+    }],
+    PaymentProfile: { ProfileID: 123 },
+  }, { '5000-BLACK-M': 2, '1717-BLUEJEAN-L': 1 });
+  assert.equal(partialSupplierResponse.outcome, 'partial');
+  assert.deepEqual(partialSupplierResponse.acceptedLines, [{ sku: '5000-BLACK-M', acceptedQty: 2 }]);
+  assert.deepEqual(partialSupplierResponse.LineErrors[0], {
+    Identifier: '1717-BLUEJEAN-L', Code: 'NO_STOCK', Message: 'No inventory is available for this SKU.',
+    RequestedQty: 1, AvailableQty: 0, Line: 1,
+  });
+  assert(!JSON.stringify(partialSupplierResponse).includes('ShippingAddress'), 'shipping details must be redacted');
+  assert(!JSON.stringify(partialSupplierResponse).includes('PaymentProfile'), 'payment details must be redacted');
+  assert(!JSON.stringify(partialSupplierResponse).includes('InternalDetail'), 'unknown supplier fields must be redacted');
+
+  const rejectedSupplierResponse = normalizeSsOrderResponse({
+    errors: [{ field: 'lines[1].identifier', code: 'SKU_NOT_FOUND', message: 'The SKU was not found.' }],
+  });
+  assert.equal(rejectedSupplierResponse.outcome, 'rejected');
+  assert.deepEqual(rejectedSupplierResponse.errors[0], {
+    field: 'lines[1].identifier', code: 'SKU_NOT_FOUND', message: 'The SKU was not found.', index: 0,
+  });
+  assert.deepEqual(rejectedSupplierResponse.LineErrors[0], {
+    Field: 'lines[1].identifier', Code: 'SKU_NOT_FOUND', Message: 'The SKU was not found.', Line: 1,
+  });
+  const rejection = supplierError(400, { errors: [{ field: 'lines[0].identifier', message: 'Invalid SKU.' }] }, 'S&S rejected the order request (HTTP 400).');
+  assert.equal(rejection.status, 400, 'deterministic S&S 4xx responses must remain 4xx');
+  assert.equal(rejection.body.errors[0].message, 'Invalid SKU.');
+  assert.equal(supplierError(401, {}, 'Unauthorized').status, 502, 'supplier authentication failures must remain uncertain rather than reject an order');
   const adapterSource = fs.readFileSync(require.resolve('../phase2-data'), 'utf8');
   assert(adapterSource.indexOf("local prior = redis.call('GET', KEYS[5])") < adapterSource.indexOf('local current = tonumber'), 'idempotent retries must be resolved before version conflicts');
   assert(adapterSource.includes('`${prefix}:idempotency:${id}:${digest(idempotencyKey)}`'), 'idempotency keys must be scoped to an order');
