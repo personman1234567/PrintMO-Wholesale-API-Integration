@@ -8,6 +8,7 @@ const http = require('http');
 const WebSocket = require('ws');
 const { createPhase2Data } = require('./phase2-data');
 const { normalizeSsOrderResponse, supplierError, supplierMessage } = require('./supplier-response');
+const { createSupplierInventoryHandler } = require('./supplier-inventory');
 
 const app = express();
 
@@ -186,6 +187,13 @@ const corsOptions = {
 app.use('/order-manager', cors(corsOptions));
 app.use('/order-manager', express.json({ limit: '2mb' }));
 app.use('/order-manager', express.urlencoded({ extended: true }));
+
+// Read-only supplier stock for the separate inventory observation Worker.
+app.get('/order-manager/v1/supplier/ss/inventory', requireAdminKey, createSupplierInventoryHandler({
+  fetchImpl: fetch,
+  accountNumber: process.env.SS_ACCOUNT_NUMBER,
+  apiKey: process.env.SS_API_KEY,
+}));
 
 // Redis-free supplier gateway. The Cloudflare data plane owns batch state and
 // sends only a validated, aggregate S&S request to this endpoint.
