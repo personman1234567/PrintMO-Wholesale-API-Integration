@@ -9,6 +9,7 @@ const WebSocket = require('ws');
 const { createPhase2Data } = require('./phase2-data');
 const { normalizeSsOrderResponse, supplierError, supplierMessage } = require('./supplier-response');
 const { createSupplierInventoryHandler } = require('./supplier-inventory');
+const { createInventoryReadAuth } = require('./inventory-auth');
 
 const app = express();
 
@@ -164,6 +165,8 @@ function normalizeRecord(rec) {
 // ─── Order Manager API: CORS + Auth ────────────────────────────────────────────
 const UI_ORIGIN = ORDER_MANAGER_UI_ORIGIN || 'https://print-mo-order-manager.pages.dev';
 const ADMIN_KEY = ORDER_MANAGER_ADMIN_KEY;
+const INVENTORY_READ_KEY = process.env.INVENTORY_READ_KEY;
+const requireInventoryReadKey = createInventoryReadAuth({ inventoryReadKey: INVENTORY_READ_KEY, adminKey: ADMIN_KEY });
 
 function requireAdminKey(req, res, next) {
   if (req.method === 'OPTIONS') return next();
@@ -181,7 +184,7 @@ const corsOptions = {
     return cb(new Error('CORS blocked: ' + origin));
   },
   methods: ['GET', 'PATCH', 'POST', 'DELETE', 'OPTIONS'],
-  allowedHeaders: ['Content-Type', 'X-Order-Manager-Key'],
+  allowedHeaders: ['Content-Type', 'X-Order-Manager-Key', 'X-Inventory-Read-Key'],
 };
 
 app.use('/order-manager', cors(corsOptions));
@@ -189,7 +192,7 @@ app.use('/order-manager', express.json({ limit: '2mb' }));
 app.use('/order-manager', express.urlencoded({ extended: true }));
 
 // Read-only supplier stock for the separate inventory observation Worker.
-app.get('/order-manager/v1/supplier/ss/inventory', requireAdminKey, createSupplierInventoryHandler({
+app.get('/order-manager/v1/supplier/ss/inventory', requireInventoryReadKey, createSupplierInventoryHandler({
   fetchImpl: fetch,
   accountNumber: process.env.SS_ACCOUNT_NUMBER,
   apiKey: process.env.SS_API_KEY,

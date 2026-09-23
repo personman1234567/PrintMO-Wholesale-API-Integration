@@ -2,6 +2,7 @@ const assert = require('node:assert/strict');
 const fs = require('node:fs');
 const test = require('node:test');
 const { createSupplierInventoryHandler, normalizeInventory, parseSkus } = require('../supplier-inventory');
+const { createInventoryReadAuth } = require('../inventory-auth');
 
 const sku = 'B00760004';
 const supplierRow = { sku, gtin: 'private', warehouses: [{ warehouseAbbr: 'IL', skuID: 1, qty: 8 }] };
@@ -21,9 +22,22 @@ function result() {
   };
 }
 
-test('gateway route is protected by the existing admin-key middleware', () => {
+test('gateway route uses a scoped key when configured and preserves staged fallback', () => {
   const source = fs.readFileSync(require.resolve('../index'), 'utf8');
-  assert.match(source, /app\.get\('\/order-manager\/v1\/supplier\/ss\/inventory', requireAdminKey, createSupplierInventoryHandler/);
+  assert.match(source, /app\.get\('\/order-manager\/v1\/supplier\/ss\/inventory', requireInventoryReadKey, createSupplierInventoryHandler/);
+  function invoke(auth, headers = {}) {
+    let called = false;
+    const res = result();
+    auth({ method: 'GET', get: name => headers[name] }, res, () => { called = true; });
+    return { called, status: res.statusCode };
+  }
+  const scoped = createInventoryReadAuth({ inventoryReadKey: 'inventory-only', adminKey: 'admin-wide' });
+  assert.deepEqual(invoke(scoped, { 'X-Inventory-Read-Key': 'inventory-only' }), { called: true, status: 200 });
+  assert.deepEqual(invoke(scoped, { 'X-Order-Manager-Key': 'admin-wide' }), { called: false, status: 401 });
+  assert.deepEqual(invoke(scoped, { 'X-Inventory-Read-Key': 'wrong' }), { called: false, status: 401 });
+  const staged = createInventoryReadAuth({ adminKey: 'admin-wide' });
+  assert.deepEqual(invoke(staged, { 'X-Order-Manager-Key': 'admin-wide' }), { called: true, status: 200 });
+  assert.deepEqual(invoke(createInventoryReadAuth({})), { called: false, status: 500 });
 });
 
 test('only one to 25 unique supplier SKUs are accepted', () => {
