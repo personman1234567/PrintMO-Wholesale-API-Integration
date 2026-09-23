@@ -9,13 +9,30 @@ function parseSkus(value) {
   return skus;
 }
 
-function normalizeInventory(payload, skus) {
+function normalizeInventory(payload, products, skus) {
   if (!Array.isArray(payload) || payload.length > skus.length) throw new Error('INVALID_SUPPLIER_RESPONSE');
+  if (!Array.isArray(products) || products.length > skus.length) throw new Error('INVALID_SUPPLIER_RESPONSE');
   const requested = new Set(skus);
+  const productFlags = new Map();
+  for (const product of products) {
+    if (!product || !requested.has(product.sku) || productFlags.has(product.sku)
+      || !Array.isArray(product.warehouses) || !product.warehouses.length || product.warehouses.length > 100) {
+      throw new Error('INVALID_SUPPLIER_RESPONSE');
+    }
+    const flags = new Map();
+    for (const warehouse of product.warehouses) {
+      if (!warehouse || !WAREHOUSE_PATTERN.test(warehouse.warehouseAbbr)
+        || flags.has(warehouse.warehouseAbbr) || typeof warehouse.dropship !== 'boolean') {
+        throw new Error('INVALID_SUPPLIER_RESPONSE');
+      }
+      flags.set(warehouse.warehouseAbbr, warehouse.dropship);
+    }
+    productFlags.set(product.sku, flags);
+  }
   const seen = new Set();
   return payload.map(item => {
     if (!item || !requested.has(item.sku) || seen.has(item.sku) || !Array.isArray(item.warehouses)
-      || !item.warehouses.length || item.warehouses.length > 100) throw new Error('INVALID_SUPPLIER_RESPONSE');
+      || !item.warehouses.length || item.warehouses.length > 100 || !productFlags.has(item.sku)) throw new Error('INVALID_SUPPLIER_RESPONSE');
     seen.add(item.sku);
     const warehouses = new Set();
     return {
@@ -23,17 +40,17 @@ function normalizeInventory(payload, skus) {
       warehouses: item.warehouses.map(warehouse => {
         if (!warehouse || !WAREHOUSE_PATTERN.test(warehouse.warehouseAbbr)
           || warehouses.has(warehouse.warehouseAbbr)
-          || !Number.isSafeInteger(warehouse.qty) || warehouse.qty < 0) throw new Error('INVALID_SUPPLIER_RESPONSE');
+          || !Number.isSafeInteger(warehouse.qty) || warehouse.qty < 0
+          || !productFlags.get(item.sku).has(warehouse.warehouseAbbr)) throw new Error('INVALID_SUPPLIER_RESPONSE');
         warehouses.add(warehouse.warehouseAbbr);
-        return { warehouseAbbr: warehouse.warehouseAbbr, qty: warehouse.qty };
+        return { warehouseAbbr: warehouse.warehouseAbbr, qty: warehouse.qty,
+          dropship: productFlags.get(item.sku).get(warehouse.warehouseAbbr) };
       }),
     };
   });
 }
 
-async function getSupplierInventory(fetchImpl, skus, credentials, sleep = ms => new Promise(resolve => setTimeout(resolve, ms))) {
-  const url = `https://api.ssactivewear.com/v2/inventory/${skus.map(encodeURIComponent).join(',')}`;
-  const auth = Buffer.from(`${credentials.accountNumber}:${credentials.apiKey}`).toString('base64');
+async function getSupplierJson(fetchImpl, url, auth, sleep) {
   for (let attempt = 0; attempt < 2; attempt++) {
     let response;
     try {
@@ -60,9 +77,17 @@ async function getSupplierInventory(fetchImpl, skus, credentials, sleep = ms => 
     let payload;
     try { payload = await response.json(); }
     catch { throw new Error('UPSTREAM_INVALID_JSON'); }
-    return { observedAt: new Date().toISOString(), items: normalizeInventory(payload, skus) };
+    return payload;
   }
   throw new Error('UPSTREAM_RETRY_EXHAUSTED');
+}
+
+async function getSupplierInventory(fetchImpl, skus, credentials, sleep = ms => new Promise(resolve => setTimeout(resolve, ms))) {
+  const suffix = skus.map(encodeURIComponent).join(',');
+  const auth = Buffer.from(`${credentials.accountNumber}:${credentials.apiKey}`).toString('base64');
+  const inventory = await getSupplierJson(fetchImpl, `https://api.ssactivewear.com/v2/inventory/${suffix}`, auth, sleep);
+  const products = await getSupplierJson(fetchImpl, `https://api.ssactivewear.com/v2/products/${suffix}`, auth, sleep);
+  return { observedAt: new Date().toISOString(), items: normalizeInventory(inventory, products, skus) };
 }
 
 function createSupplierInventoryHandler({ fetchImpl, accountNumber, apiKey, sleep } = {}) {

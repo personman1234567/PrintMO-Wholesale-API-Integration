@@ -5,7 +5,9 @@ const { createSupplierInventoryHandler, normalizeInventory, parseSkus } = requir
 const { createInventoryReadAuth } = require('../inventory-auth');
 
 const sku = 'B00760004';
-const supplierRow = { sku, gtin: 'private', warehouses: [{ warehouseAbbr: 'IL', skuID: 1, qty: 8 }] };
+const supplierRow = { sku, gtin: 'private', warehouses: [{ warehouseAbbr: 'IL', skuID: 1, qty: 8 }, { warehouseAbbr: 'DS', skuID: 2, qty: 99 }] };
+const productRow = { sku, brandName: 'private', warehouses: [{ warehouseAbbr: 'IL', dropship: false }, { warehouseAbbr: 'DS', dropship: true }] };
+const normalized = [{ sku, warehouses: [{ warehouseAbbr: 'IL', qty: 8, dropship: false }, { warehouseAbbr: 'DS', qty: 99, dropship: true }] }];
 const reply = (payload, status = 200, headers = {}) => ({
   status,
   ok: status >= 200 && status < 300,
@@ -47,33 +49,36 @@ test('only one to 25 unique supplier SKUs are accepted', () => {
   }
 });
 
-test('supplier payload is reduced to exact SKU and warehouse quantity', () => {
-  assert.deepEqual(normalizeInventory([supplierRow], [sku]), [{ sku, warehouses: [{ warehouseAbbr: 'IL', qty: 8 }] }]);
+test('inventory and product metadata join by SKU and warehouse, preserving only dropship flags', () => {
+  assert.deepEqual(normalizeInventory([supplierRow], [productRow], [sku]), normalized);
   for (const payload of [null, [supplierRow, supplierRow], [{ ...supplierRow, sku: 'OTHER' }],
     [{ ...supplierRow, warehouses: [{ warehouseAbbr: 'IL', qty: -1 }] }],
     [{ ...supplierRow, warehouses: [{ warehouseAbbr: 'IL', qty: '8' }] }]]) {
-    assert.throws(() => normalizeInventory(payload, [sku]), /INVALID_SUPPLIER_RESPONSE/);
+    assert.throws(() => normalizeInventory(payload, [productRow], [sku]), /INVALID_SUPPLIER_RESPONSE/);
   }
+  assert.throws(() => normalizeInventory([supplierRow], [], [sku]), /INVALID_SUPPLIER_RESPONSE/);
+  assert.throws(() => normalizeInventory([supplierRow], [{ ...productRow, warehouses: [{ warehouseAbbr: 'IL', dropship: false }] }], [sku]), /INVALID_SUPPLIER_RESPONSE/);
+  assert.throws(() => normalizeInventory([supplierRow], [{ ...productRow, warehouses: [{ warehouseAbbr: 'IL' }, productRow.warehouses[1]] }], [sku]), /INVALID_SUPPLIER_RESPONSE/);
 });
 
-test('handler makes one authenticated GET and emits no supplier extras', async () => {
+test('handler makes two authenticated GETs and emits no supplier extras', async () => {
   let calls = 0;
   const handler = createSupplierInventoryHandler({
     fetchImpl: async (url, options) => {
       calls++;
-      assert.equal(url, `https://api.ssactivewear.com/v2/inventory/${sku}`);
+      assert.equal(url, `https://api.ssactivewear.com/v2/${calls === 1 ? 'inventory' : 'products'}/${sku}`);
       assert.equal(options.method, 'GET');
       assert.equal(options.redirect, 'error');
       assert.match(options.headers.Authorization, /^Basic /);
-      return reply([supplierRow]);
+      return reply(calls === 1 ? [supplierRow] : [productRow]);
     }, accountNumber: 'account', apiKey: 'secret',
   });
   const res = result();
   await handler({ query: { skus: sku } }, res);
-  assert.equal(calls, 1);
+  assert.equal(calls, 2);
   assert.equal(res.headers['Cache-Control'], 'no-store');
   assert.equal(res.statusCode, 200);
-  assert.deepEqual(res.body.items, [{ sku, warehouses: [{ warehouseAbbr: 'IL', qty: 8 }] }]);
+  assert.deepEqual(res.body.items, normalized);
   assert.ok(Number.isFinite(Date.parse(res.body.observedAt)));
   assert.doesNotMatch(JSON.stringify(res.body), /private|secret|skuID/);
 });
@@ -101,6 +106,17 @@ test('upstream errors do not become zero stock or leak the response body', async
   await handler({ query: { skus: sku } }, res);
   assert.equal(res.statusCode, 502);
   assert.deepEqual(res.body, { error: 'UPSTREAM_HTTP_404' });
+});
+
+test('missing product metadata fails the whole read instead of counting stock', async () => {
+  let calls = 0;
+  const handler = createSupplierInventoryHandler({
+    fetchImpl: async () => reply(++calls === 1 ? [supplierRow] : []), accountNumber: 'a', apiKey: 'b',
+  });
+  const res = result();
+  await handler({ query: { skus: sku } }, res);
+  assert.equal(res.statusCode, 502);
+  assert.deepEqual(res.body, { error: 'INVALID_SUPPLIER_RESPONSE' });
 });
 
 test('throttling retries only once and respects long Retry-After', async () => {
