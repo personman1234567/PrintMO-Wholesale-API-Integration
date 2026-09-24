@@ -4,9 +4,10 @@
   "main": "index.js",
   "scripts": {
     "start": "node index.js",
-    "test": "npm run verify:phase2 && npm run verify:inventory",
+    "test": "npm run verify:phase2 && npm run verify:inventory && npm run verify:order-status",
     "verify:phase2": "node scripts/verify-phase2.js",
-    "verify:inventory": "node --test scripts/verify-inventory.js"
+    "verify:inventory": "node --test scripts/verify-inventory.js",
+    "verify:order-status": "node --test scripts/verify-order-status.js"
   },
   "keywords": [],
   "author": "",

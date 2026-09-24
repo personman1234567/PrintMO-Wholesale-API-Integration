@@ -10,6 +10,7 @@ const { createPhase2Data } = require('./phase2-data');
 const { normalizeSsOrderResponse, supplierError, supplierMessage } = require('./supplier-response');
 const { createSupplierInventoryHandler } = require('./supplier-inventory');
 const { createInventoryReadAuth } = require('./inventory-auth');
+const { createSupplierOrderStatusHandler } = require('./supplier-order-status');
 
 const app = express();
 
@@ -193,6 +194,13 @@ app.use('/order-manager', express.urlencoded({ extended: true }));
 
 // Read-only supplier stock for the separate inventory observation Worker.
 app.get('/order-manager/v1/supplier/ss/inventory', requireInventoryReadKey, createSupplierInventoryHandler({
+  fetchImpl: fetch,
+  accountNumber: process.env.SS_ACCOUNT_NUMBER,
+  apiKey: process.env.SS_API_KEY,
+}));
+
+// Read-only, bounded supplier order and carrier status for Order Manager's scheduler.
+app.get('/order-manager/v1/supplier/ss/order-status', requireAdminKey, createSupplierOrderStatusHandler({
   fetchImpl: fetch,
   accountNumber: process.env.SS_ACCOUNT_NUMBER,
   apiKey: process.env.SS_API_KEY,
