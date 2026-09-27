@@ -103,9 +103,21 @@ async function run() {
     SS_ACCOUNT_NUMBER: 'fixture-account', SS_API_KEY: 'fixture-key',
     SS_PAYMENT_PROFILE_ID: '123', SS_PAYMENT_PROFILE_EMAIL: 'fixture@example.test',
   };
-  const supplierOptions = { aggregate: { 'TEST-SKU': 2 }, orderCount: 1, purchaseOrder: 'PM-TEST', testOrder: true };
+  const supplierOptions = { aggregate: { 'TEST-SKU': 2 }, orderCount: 1, purchaseOrder: 'PM-TEST', testOrder: false };
   const fakeResponse = (status, body) => ({ status, ok: status >= 200 && status < 300, json: async () => body });
   const acceptedOrder = { Orders: [{ OrderNumber: 'SS-TEST-2001' }] };
+  const cartSkus = Object.fromEntries(Array.from({ length: 79 }, (_, index) => [`TEST-SKU-${index}`, 1]));
+  let cartPostCount = 0;
+  const cartResult = await submitSsOrder({ ...supplierOptions, aggregate: cartSkus, testOrder: true }, {
+    env: supplierEnv, fetchImpl: async (url, options) => {
+      assert(url.endsWith('/v2/orders/'), 'cart workflow must skip all per-SKU price reads');
+      assert.equal(JSON.parse(options.body).testOrder, true, 'cart workflow must remain a test order');
+      cartPostCount += 1;
+      return fakeResponse(200, acceptedOrder);
+    },
+  });
+  assert.equal(cartPostCount, 1, 'large cart batch makes exactly one mocked S&S request');
+  assert.equal(cartResult.subtotal, null, 'cart workflow has no price estimate');
   let productReads = 0;
   let orderPosts = 0;
   const recoveredPrice = await submitSsOrder(supplierOptions, {
@@ -115,7 +127,7 @@ async function run() {
         return fakeResponse(productReads === 1 ? 503 : 200, { customerPrice: 3.25 });
       }
       orderPosts += 1;
-      assert.equal(JSON.parse(options.body).testOrder, true, 'repair must not enable live ordering');
+      assert.equal(JSON.parse(options.body).testOrder, false, 'non-test pricing fixture remains separate from cart mode');
       return fakeResponse(200, acceptedOrder);
     },
   });
