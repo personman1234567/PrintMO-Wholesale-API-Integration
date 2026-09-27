@@ -7,7 +7,7 @@ const cors = require('cors');
 const http = require('http');
 const WebSocket = require('ws');
 const { createPhase2Data } = require('./phase2-data');
-const { normalizeSsOrderResponse, supplierError, supplierMessage } = require('./supplier-response');
+const { submitSsOrder } = require('./supplier-order-submit');
 const { createSupplierInventoryHandler } = require('./supplier-inventory');
 const { createInventoryReadAuth } = require('./inventory-auth');
 const { createSupplierOrderStatusHandler } = require('./supplier-order-status');
@@ -243,7 +243,12 @@ app.post('/order-manager/v1/supplier/ss/commit', requireAdminKey, async (req, re
   } catch (error) {
     console.error('Redis-free S&S commit failed:', error);
     const status = Number(error?.status) || 502;
-    return res.status(status).json(error?.body || { error: { message: error?.message || String(error) } });
+    const body = error?.body || { error: { message: error?.message || String(error) } };
+    return res.status(status).json({
+      ...body,
+      ...(typeof error?.orderSubmissionAttempted === 'boolean'
+        ? { orderSubmissionAttempted: error.orderSubmissionAttempted } : {}),
+    });
   }
 });
 
@@ -557,104 +562,6 @@ app.post('/order-manager/orders/delete', requireAdminKey, async (req, res) => {
 
   return res.json({ ok: true });
 });
-
-// Submit batch to S&S (server-side)
-async function submitSsOrder({ aggregate, orderCount, purchaseOrder, testOrder = true }) {
-  const skus = Object.keys(aggregate || {});
-  if (!skus.length) throw Object.assign(new Error('No SKUs found to submit'), { status: 400 });
-
-  const {
-    SS_ACCOUNT_NUMBER,
-    SS_API_KEY,
-    SS_PAYMENT_PROFILE_ID,
-    SS_PAYMENT_PROFILE_EMAIL,
-  } = process.env;
-  if (!SS_ACCOUNT_NUMBER || !SS_API_KEY) {
-    throw Object.assign(new Error('Missing SS_ACCOUNT_NUMBER or SS_API_KEY on server'), { status: 500 });
-  }
-  if (!SS_PAYMENT_PROFILE_ID || !SS_PAYMENT_PROFILE_EMAIL) {
-    throw Object.assign(new Error('Missing SS_PAYMENT_PROFILE_ID or SS_PAYMENT_PROFILE_EMAIL on server'), { status: 500 });
-  }
-
-  const auth = 'Basic ' + Buffer.from(`${SS_ACCOUNT_NUMBER}:${SS_API_KEY}`).toString('base64');
-  let subtotal = 0;
-  const priceWarnings = [];
-  for (const [lineIndex, [sku, qty]] of Object.entries(aggregate).entries()) {
-    const response = await fetch(
-      `https://api.ssactivewear.com/v2/products/${encodeURIComponent(sku)}?mediatype=json`,
-      { headers: { Authorization: auth, Accept: 'application/json' } }
-    );
-    const json = await response.json().catch(() => ({}));
-    if (!response.ok) {
-      const fallback = `S&S product lookup failed for ${sku} (HTTP ${response.status}).`;
-      throw supplierError(response.status, {
-        LineErrors: [{
-          Identifier: sku,
-          Field: `lines[${lineIndex}].identifier`,
-          Code: 'PRODUCT_LOOKUP_FAILED',
-          Message: supplierMessage(json, fallback),
-          RequestedQty: qty,
-        }],
-      }, fallback);
-    }
-    const product = Array.isArray(json) ? json[0] : json;
-    const raw =
-      product?.customerPrice ?? product?.CustomerPrice ??
-      product?.piecePrice ?? product?.PiecePrice ??
-      product?.salePrice ?? product?.SalePrice ??
-      product?.casePrice ?? product?.CasePrice ??
-      product?.Price ?? product?.price ?? null;
-    const parsed = raw == null ? NaN : parseFloat(String(raw));
-    if (Number.isFinite(parsed)) subtotal += parsed * qty;
-    else priceWarnings.push({ sku, raw });
-  }
-
-  const payload = {
-    customer: `${purchaseOrder || 'PrintMO'} · ${orderCount} order${orderCount === 1 ? '' : 's'}`,
-    testOrder: Boolean(testOrder),
-    autoSelectWarehouse: true,
-    rejectLineErrors: false,
-    shippingAddress: {
-      Name: 'LoGo Fishin Attn: TJ Reid',
-      Address: '328 Bristlecone Ct S',
-      City: 'Saint Charles',
-      State: 'MO',
-      Zip: '63304',
-      Country: 'USA',
-    },
-    Lines: Object.entries(aggregate).map(([Identifier, Qty]) => ({ Identifier, Qty })),
-    PaymentProfile: {
-      ProfileID: parseInt(SS_PAYMENT_PROFILE_ID, 10),
-      Email: SS_PAYMENT_PROFILE_EMAIL,
-    },
-  };
-
-  const response = await fetch('https://api.ssactivewear.com/v2/orders/', {
-    method: 'POST',
-    headers: {
-      'Content-Type': 'application/json',
-      Authorization: auth,
-      Accept: 'application/json',
-    },
-    body: JSON.stringify(payload),
-  });
-  const json = await response.json().catch(() => ({}));
-  if (!response.ok) throw supplierError(response.status, json, `S&S rejected the order request (HTTP ${response.status}).`);
-  const safeResponse = normalizeSsOrderResponse(json, aggregate);
-  const created = safeResponse.Orders.find(order => order.OrderNumber);
-  if (!created?.OrderNumber && safeResponse.outcome === 'unknown') {
-    throw supplierError(502, json, 'S&S did not confirm whether an order was created.');
-  }
-  return {
-    ...safeResponse,
-    orderNumber: created?.OrderNumber || null,
-    count: orderCount,
-    subtotal: Number(subtotal.toFixed(2)),
-    skuCount: skus.length,
-    priceWarnings,
-    testOrder: Boolean(testOrder),
-  };
-}
 
 app.post('/order-manager/orders/process-batch', requireAdminKey, async (req, res) => {
   try {
