@@ -2,7 +2,7 @@
 
 ## Order Manager S&S submission
 
-`POST /order-manager/v1/supplier/ss/commit` validates aggregate SKUs, estimates pricing, and makes one S&S order POST. Transient product-price lookup failures receive at most three retries across the entire batch; if pricing is still unavailable, the gateway sends the order with a null estimated subtotal and a SKU-scoped price warning. A failure before the order POST returns `orderSubmissionAttempted: false`, while a failure during or after it returns `true`. The Order Manager uses that marker to distinguish a retryable preflight failure from an order result that must be reconciled. The gateway never retries an order POST. The Worker controls `testOrder`; this gateway change does not enable live purchasing.
+`POST /order-manager/v1/supplier/ss/commit` validates aggregate SKUs and makes one S&S order POST. In the `testOrder` cart workflow it skips optional per-SKU price lookups, leaving the estimated subtotal null; a large batch otherwise consumes S&S's 60-requests-per-minute API budget before the POST. For a future non-test submission, transient product-price lookup failures receive at most three retries across the entire batch; if pricing is still unavailable, the gateway sends the order with a null estimated subtotal and a SKU-scoped price warning. A failure before the order POST returns `orderSubmissionAttempted: false`, while a failure during or after it returns `true`. The Order Manager uses that marker to distinguish a retryable preflight failure from an uncertain result. The gateway never retries an order POST. The Worker controls `testOrder`; this change does not enable live purchasing.
 
 ## Read-only S&S inventory gateway
 

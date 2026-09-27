@@ -32,9 +32,12 @@ async function submitSsOrderRequest({ aggregate, orderCount, purchaseOrder, test
   }
 
   const auth = 'Basic ' + Buffer.from(`${SS_ACCOUNT_NUMBER}:${SS_API_KEY}`).toString('base64');
-  const { subtotal, priceWarnings } = await estimateSupplierPricing(aggregate, {
-    fetchImpl, authorization: auth, wait,
-  });
+  // The test-order cart workflow only needs S&S to validate the lines. Reading
+  // every product price first can exhaust S&S's shared API request budget for
+  // a large batch before the single order POST is made.
+  const { subtotal, priceWarnings } = testOrder
+    ? { subtotal: null, priceWarnings: [] }
+    : await estimateSupplierPricing(aggregate, { fetchImpl, authorization: auth, wait });
 
   const payload = {
     customer: `${purchaseOrder || 'PrintMO'} · ${orderCount} order${orderCount === 1 ? '' : 's'}`,
