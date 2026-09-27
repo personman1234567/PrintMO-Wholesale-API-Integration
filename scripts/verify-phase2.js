@@ -3,6 +3,7 @@ const crypto = require('crypto');
 const fs = require('fs');
 const { createPhase2Data, canonicalStage } = require('../phase2-data');
 const { normalizeSsOrderResponse, supplierError } = require('../supplier-response');
+const { submitSsOrder } = require('../supplier-order-submit');
 
 class FakeRedis {
   constructor() {
@@ -98,6 +99,57 @@ async function run() {
   assert.equal(rejection.status, 400, 'deterministic S&S 4xx responses must remain 4xx');
   assert.equal(rejection.body.errors[0].message, 'Invalid SKU.');
   assert.equal(supplierError(401, {}, 'Unauthorized').status, 502, 'supplier authentication failures must remain uncertain rather than reject an order');
+  const supplierEnv = {
+    SS_ACCOUNT_NUMBER: 'fixture-account', SS_API_KEY: 'fixture-key',
+    SS_PAYMENT_PROFILE_ID: '123', SS_PAYMENT_PROFILE_EMAIL: 'fixture@example.test',
+  };
+  const supplierOptions = { aggregate: { 'TEST-SKU': 2 }, orderCount: 1, purchaseOrder: 'PM-TEST', testOrder: true };
+  const fakeResponse = (status, body) => ({ status, ok: status >= 200 && status < 300, json: async () => body });
+  const acceptedOrder = { Orders: [{ OrderNumber: 'SS-TEST-2001' }] };
+  let productReads = 0;
+  let orderPosts = 0;
+  const recoveredPrice = await submitSsOrder(supplierOptions, {
+    env: supplierEnv, wait: async () => {}, fetchImpl: async (url, options) => {
+      if (url.includes('/products/')) {
+        productReads += 1;
+        return fakeResponse(productReads === 1 ? 503 : 200, { customerPrice: 3.25 });
+      }
+      orderPosts += 1;
+      assert.equal(JSON.parse(options.body).testOrder, true, 'repair must not enable live ordering');
+      return fakeResponse(200, acceptedOrder);
+    },
+  });
+  assert.equal(productReads, 2, 'one transient product 503 gets a bounded retry');
+  assert.equal(orderPosts, 1, 'the order POST is never retried');
+  assert.equal(recoveredPrice.subtotal, 6.5);
+
+  productReads = 0;
+  orderPosts = 0;
+  const missingPrice = await submitSsOrder(supplierOptions, {
+    env: supplierEnv, wait: async () => {}, fetchImpl: async (url) => {
+      if (url.includes('/products/')) { productReads += 1; return fakeResponse(503, {}); }
+      orderPosts += 1;
+      return fakeResponse(200, acceptedOrder);
+    },
+  });
+  assert.equal(productReads, 4, 'the whole batch has only three product-lookup retries');
+  assert.equal(orderPosts, 1, 'an unavailable optional price does not block the S&S order POST');
+  assert.equal(missingPrice.subtotal, null, 'an incomplete subtotal must not be shown as a complete estimate');
+  assert.deepEqual(missingPrice.priceWarnings.map(warning => warning.sku), ['TEST-SKU']);
+
+  orderPosts = 0;
+  await assert.rejects(submitSsOrder(supplierOptions, {
+    env: supplierEnv, wait: async () => {}, fetchImpl: async (url) => {
+      if (url.includes('/products/')) return fakeResponse(404, { Message: 'SKU missing' });
+      orderPosts += 1;
+      return fakeResponse(200, acceptedOrder);
+    },
+  }), error => error.status === 404 && error.orderSubmissionAttempted === false);
+  assert.equal(orderPosts, 0, 'a deterministic preflight rejection cannot reach the order POST');
+  await assert.rejects(submitSsOrder(supplierOptions, {
+    env: supplierEnv, wait: async () => {}, fetchImpl: async (url) => url.includes('/products/')
+      ? fakeResponse(200, { customerPrice: 3.25 }) : fakeResponse(503, {}),
+  }), error => error.status === 502 && error.orderSubmissionAttempted === true);
   const adapterSource = fs.readFileSync(require.resolve('../phase2-data'), 'utf8');
   assert(adapterSource.indexOf("local prior = redis.call('GET', KEYS[5])") < adapterSource.indexOf('local current = tonumber'), 'idempotent retries must be resolved before version conflicts');
   assert(adapterSource.includes('`${prefix}:idempotency:${id}:${digest(idempotencyKey)}`'), 'idempotency keys must be scoped to an order');

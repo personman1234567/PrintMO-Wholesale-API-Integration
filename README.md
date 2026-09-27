@@ -1,5 +1,9 @@
 # PrintMO-Wholesale-API-Integration
 
+## Order Manager S&S submission
+
+`POST /order-manager/v1/supplier/ss/commit` validates aggregate SKUs, estimates pricing, and makes one S&S order POST. Transient product-price lookup failures receive at most three retries across the entire batch; if pricing is still unavailable, the gateway sends the order with a null estimated subtotal and a SKU-scoped price warning. A failure before the order POST returns `orderSubmissionAttempted: false`, while a failure during or after it returns `true`. The Order Manager uses that marker to distinguish a retryable preflight failure from an order result that must be reconciled. The gateway never retries an order POST. The Worker controls `testOrder`; this gateway change does not enable live purchasing.
+
 ## Read-only S&S inventory gateway
 
 `GET /order-manager/v1/supplier/ss/inventory?skus=SKU1,SKU2` serves the separate inventory observation Worker. Set `INVENTORY_READ_KEY` on Render and send it in `X-Inventory-Read-Key` so the Worker has access only to this read route. Until that key is configured, the route retains its existing `X-Order-Manager-Key` authentication for a staged deployment; once configured, the admin key no longer authenticates this route. The gateway holds `SS_ACCOUNT_NUMBER` and `SS_API_KEY` server-side. Requests must contain 1–25 distinct S&S SKUs. The response contains only `observedAt` and `items` with `sku` and warehouse rows of `warehouseAbbr`, nonnegative integer `qty`, and boolean `dropship`; it is marked `Cache-Control: no-store`. Missing supplier rows remain missing, and upstream errors never become zero stock.
