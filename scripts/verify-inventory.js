@@ -61,6 +61,19 @@ test('inventory and product metadata join by SKU and warehouse, preserving only 
   assert.throws(() => normalizeInventory([supplierRow], [{ ...productRow, warehouses: [{ warehouseAbbr: 'IL' }, productRow.warehouses[1]] }], [sku]), /INVALID_SUPPLIER_RESPONSE/);
 });
 
+test('repeated DS product metadata is safe only when every flag is dropship true', () => {
+  const repeated = { ...productRow, warehouses: [...productRow.warehouses,
+    { warehouseAbbr: 'DS', dropship: true }] };
+  assert.deepEqual(normalizeInventory([supplierRow], [repeated], [sku]), normalized);
+  for (const duplicate of [{ warehouseAbbr: 'DS', dropship: false },
+    { warehouseAbbr: 'IL', dropship: false }, { warehouseAbbr: 'IL', dropship: true }]) {
+    assert.throws(() => normalizeInventory([supplierRow],
+      [{ ...productRow, warehouses: [...productRow.warehouses, duplicate] }], [sku]), /INVALID_SUPPLIER_RESPONSE/);
+  }
+  assert.throws(() => normalizeInventory([{ ...supplierRow, warehouses: [...supplierRow.warehouses,
+    { warehouseAbbr: 'DS', qty: 5 }] }], [repeated], [sku]), /INVALID_SUPPLIER_RESPONSE/);
+});
+
 test('handler makes two authenticated GETs and emits no supplier extras', async () => {
   let calls = 0;
   const handler = createSupplierInventoryHandler({

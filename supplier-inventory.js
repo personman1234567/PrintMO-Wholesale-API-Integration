@@ -22,7 +22,14 @@ function normalizeInventory(payload, products, skus) {
     const flags = new Map();
     for (const warehouse of product.warehouses) {
       if (!warehouse || !WAREHOUSE_PATTERN.test(warehouse.warehouseAbbr)
-        || flags.has(warehouse.warehouseAbbr) || typeof warehouse.dropship !== 'boolean') {
+        || typeof warehouse.dropship !== 'boolean') {
+        throw new Error('INVALID_SUPPLIER_RESPONSE');
+      }
+      if (flags.has(warehouse.warehouseAbbr)) {
+        // S&S can return multiple vendor rows under DS. They are all excluded
+        // from physical stock; only an unambiguous repeated dropship flag is safe.
+        if (warehouse.warehouseAbbr === 'DS' && warehouse.dropship === true
+          && flags.get('DS') === true) continue;
         throw new Error('INVALID_SUPPLIER_RESPONSE');
       }
       flags.set(warehouse.warehouseAbbr, warehouse.dropship);
