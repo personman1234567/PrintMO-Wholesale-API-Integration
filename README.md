@@ -2,7 +2,11 @@
 
 ## Order Manager S&S submission
 
-`POST /order-manager/v1/supplier/ss/commit` validates aggregate SKUs and makes one S&S order POST. In the `testOrder` cart workflow it skips optional per-SKU price lookups, leaving the estimated subtotal null; a large batch otherwise consumes S&S's 60-requests-per-minute API budget before the POST. For a future non-test submission, transient product-price lookup failures receive at most three retries across the entire batch; if pricing is still unavailable, the gateway sends the order with a null estimated subtotal and a SKU-scoped price warning. A failure before the order POST returns `orderSubmissionAttempted: false`, while a failure during or after it returns `true`. The Order Manager uses that marker to distinguish a retryable preflight failure from an uncertain result. The gateway never retries an order POST. The Worker controls `testOrder`; this change does not enable live purchasing.
+`POST /order-manager/v1/supplier/ss/commit` validates aggregate SKUs and makes one S&S order POST. In the `testOrder` order-placement workflow it skips optional per-SKU price lookups, leaving the estimated subtotal null; a large batch otherwise consumes S&S's 60-requests-per-minute API budget before the POST. For a future non-test submission, transient product-price lookup failures receive at most three retries across the entire batch; if pricing is still unavailable, the gateway sends the order with a null estimated subtotal and a SKU-scoped price warning. A failure before the order POST returns `orderSubmissionAttempted: false`, while a failure during or after it returns `true`. The Order Manager uses that marker to distinguish a retryable preflight failure from an uncertain result. The gateway never retries an order POST. The Worker controls `testOrder`; this change does not enable live purchasing.
+
+Response mapping selects the documented `sku` before numeric `skuID` independently of JSON property order. An ID-only response stays ID-only; it is never guessed into a SKU. Missing, null and blank quantities remain missing, while explicit zero remains zero. The additive `acceptanceEvidence` distinguishes native line quantities from summary-derived request quantities. Synthetic contract tests run as part of `npm test`.
+
+The supplier operation is the Orders API POST in either mode; `testOrder` is not a website-cart operation. The gateway does not automate the owner's manual cancel/add-back-to-cart step.
 
 ## Read-only S&S inventory gateway
 

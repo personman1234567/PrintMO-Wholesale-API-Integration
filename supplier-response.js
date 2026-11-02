@@ -2,9 +2,13 @@
 
 function value(object, names) {
   if (!object || typeof object !== 'object') return undefined;
-  const wanted = new Set(names.map(name => String(name).toLowerCase()));
-  const key = Object.keys(object).find(candidate => wanted.has(candidate.toLowerCase()));
-  return key ? object[key] : undefined;
+  const keys = Object.keys(object);
+  // Name priority is contractual: sku and skuID are different identifiers.
+  for (const name of names) {
+    const key = keys.find(candidate => candidate.toLowerCase() === String(name).toLowerCase());
+    if (key !== undefined && object[key] !== undefined && object[key] !== null) return object[key];
+  }
+  return undefined;
 }
 
 function text(input, fallback = '') {
@@ -14,6 +18,7 @@ function text(input, fallback = '') {
 }
 
 function finiteNumber(input) {
+  if (input === undefined || input === null || (typeof input === 'string' && !input.trim())) return null;
   const parsed = Number(input);
   return Number.isFinite(parsed) ? parsed : null;
 }
@@ -112,6 +117,7 @@ function normalizeSsOrderResponse(payload, aggregate = {}) {
     Orders,
     LineErrors,
     acceptedLines,
+    acceptanceEvidence: acceptedFromOrders.length ? 'supplier_reported' : acceptedLines.length ? 'summary_confirmed' : 'unconfirmed',
     ...(errors.length ? { errors } : {}),
   };
 }
