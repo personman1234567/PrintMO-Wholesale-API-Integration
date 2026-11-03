@@ -45,7 +45,7 @@ const supplierOptions = { aggregate, orderCount: 1, purchaseOrder: 'SYNTHETIC-ER
 const supplierEnv = { SS_ACCOUNT_NUMBER: 'fixture-account', SS_API_KEY: 'fixture-key',
   SS_PAYMENT_PROFILE_ID: '123', SS_PAYMENT_PROFILE_EMAIL: 'fixture@example.test' };
 
-test('native JSON 503 stays separate from gateway 502 and preserves only bounded safe error evidence', async () => {
+test('native JSON 503 is preserved with only bounded safe error evidence', async () => {
   let syntheticPosts = 0;
   await assert.rejects(submitSsOrder(supplierOptions, { env: supplierEnv, fetchImpl: async (url, options) => {
     syntheticPosts++;
@@ -56,7 +56,7 @@ test('native JSON 503 stays separate from gateway 502 and preserves only bounded
       shippingAddress: 'do-not-store-customer', PaymentProfile: 'do-not-store-payment', Authorization: 'do-not-store-auth' }),
       { status: 503, headers: { 'Content-Type': 'application/json', 'X-Private': 'do-not-store-header' } });
   } }), error => {
-    assert.equal(error.status, 502); assert.equal(error.body.upstreamHttpStatus, 503);
+    assert.equal(error.status, 503); assert.equal(error.body.upstreamHttpStatus, 503);
     assert.equal(error.message, 'S&S maintenance in progress');
     assert.equal(error.body.error.message, error.message); assert.equal(error.body.error.code, 'Maintenance');
     assert.equal(error.body.responseBodyFormat, 'json'); assert.equal(error.orderSubmissionAttempted, true);
@@ -69,7 +69,7 @@ test('native JSON 503 stays separate from gateway 502 and preserves only bounded
 test('non-JSON 503 uses an explicit safe fallback and never retains the raw body', async () => {
   await assert.rejects(submitSsOrder(supplierOptions, { env: supplierEnv, fetchImpl: async () =>
     new Response('<html>private-customer private-payment private-auth</html>', { status: 503 }) }), error => {
-    assert.equal(error.status, 502); assert.equal(error.body.upstreamHttpStatus, 503);
+    assert.equal(error.status, 503); assert.equal(error.body.upstreamHttpStatus, 503);
     assert.equal(error.body.responseBodyFormat, 'non_json'); assert.equal(error.orderSubmissionAttempted, true);
     assert.match(error.body.error.message, /HTTP 503 without a readable supplier message/);
     assert.doesNotMatch(JSON.stringify(error.body), /private-|<html>/);

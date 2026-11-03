@@ -7,9 +7,10 @@ const path = require('node:path');
 const vm = require('node:vm');
 const express = require('express');
 const { submitSsOrder } = require('../../supplier-order-submit');
+const { sendSupplierCommitResponse } = require('../../supplier-commit-response');
 
 const fixtureGatewayKey = 'synthetic-gateway-key';
-function createSupplierCommitFixture({ nativeFetch, now = Date.now }) {
+function createSupplierCommitFixture({ nativeFetch, now = Date.now, boundaryLog = () => {}, terminateResponse = false }) {
   if (typeof nativeFetch !== 'function') throw new TypeError('A mocked nativeFetch is required.');
   const app = express();
   app.use(express.json());
@@ -24,6 +25,15 @@ function createSupplierCommitFixture({ nativeFetch, now = Date.now }) {
     requireAdminKey: (request, response, next) => request.get('X-Order-Manager-Key') === fixtureGatewayKey
       ? next() : response.status(401).json({ error: 'Unauthorized fixture request' }),
     submitSsOrder: options => submitSsOrder(options, { env, fetchImpl: nativeFetch, now }),
+    sendSupplierCommitResponse: (req, res, status, body) => {
+      if (terminateResponse) res.send = function () {
+        this.setHeader('Content-Length', '10000');
+        this.write('{');
+        setTimeout(() => this.destroy(), 25);
+        return this;
+      };
+      return sendSupplierCommitResponse(req, res, status, body, boundaryLog);
+    },
     console: { error() {} },
   }, { filename: 'actual-supplier-commit-handler.fixture.js' });
   return app;

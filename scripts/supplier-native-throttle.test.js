@@ -32,7 +32,7 @@ test('actual Express commit serializes the exact native throttle and timestamp-a
     });
   }, async commit => {
     const { status, body } = await commit();
-    assert.equal(status, 502); assert.equal(body.upstreamHttpStatus, 503);
+    assert.equal(status, 503); assert.equal(body.upstreamHttpStatus, 503);
     assert.equal(body.failureKind, 'rate_limited'); assert.equal(body.outcome, 'rejected');
     assert.equal(body.supplierErrorCode, '503'); assert.equal(body.error.code, '503');
     assert.equal(body.error.message, throttleMessage); assert.equal(body.orderSubmissionAttempted, true);
@@ -64,7 +64,7 @@ test('generic, incomplete, HTML and contradictory native 503 responses stay unkn
   }, async commit => {
     for (current of cases) {
       const { status, body } = await commit();
-      assert.equal(status, 502); assert.equal(body.outcome, 'unknown');
+      assert.equal(status, 503); assert.equal(body.outcome, 'unknown');
       assert.equal(body.failureKind, undefined); assert.equal(body.orderSubmissionAttempted, true);
       assert.doesNotMatch(JSON.stringify(body), /private-payment|private-customer/);
     }

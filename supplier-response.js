@@ -145,7 +145,10 @@ function supplierError(status, payload, fallbackMessage, responseEvidence = {}) 
     : Number.isSafeInteger(headerDelay) && headerDelay >= 0 ? headerDelay : null;
   const retryTime = Number.isFinite(responseTime) && retryAfterSeconds !== null ? responseTime + retryAfterSeconds * 1000 : NaN;
   const error = new Error(message);
-  error.status = [400, 404, 422].includes(Number(status)) ? Number(status) : 502;
+  // Preserve an actual supplier error status; 502 describes a gateway failure,
+  // not every native error (notably the documented native 503 throttle).
+  error.status = Number.isInteger(Number(status)) && Number(status) >= 400 && Number(status) <= 599
+    ? Number(status) : 502;
   error.body = {
     ...normalized,
     ...(upstreamHttpStatus === 503 ? { outcome: rateLimited ? 'rejected' : 'unknown' } : {}),

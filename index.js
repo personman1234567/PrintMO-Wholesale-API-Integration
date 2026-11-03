@@ -8,6 +8,7 @@ const http = require('http');
 const WebSocket = require('ws');
 const { createPhase2Data } = require('./phase2-data');
 const { submitSsOrder } = require('./supplier-order-submit');
+const { sendSupplierCommitResponse } = require('./supplier-commit-response');
 const { createSupplierInventoryHandler } = require('./supplier-inventory');
 const { createInventoryReadAuth } = require('./inventory-auth');
 const { createSupplierOrderStatusHandler } = require('./supplier-order-status');
@@ -234,7 +235,7 @@ app.post('/order-manager/v1/supplier/ss/commit', requireAdminKey, async (req, re
       purchaseOrder: String(body.poNumber || body.batchId).slice(0, 50),
       testOrder: body.testOrder !== false,
     });
-    return res.json({
+    return sendSupplierCommitResponse(req, res, 200, {
       ok: true,
       batchId: body.batchId,
       requestHash: body.lineHash || null,
@@ -244,7 +245,7 @@ app.post('/order-manager/v1/supplier/ss/commit', requireAdminKey, async (req, re
     console.error('Redis-free S&S commit failed:', error);
     const status = Number(error?.status) || 502;
     const body = error?.body || { error: { message: error?.message || String(error) } };
-    return res.status(status).json({
+    return sendSupplierCommitResponse(req, res, status, {
       ...body,
       ...(typeof error?.orderSubmissionAttempted === 'boolean'
         ? { orderSubmissionAttempted: error.orderSubmissionAttempted } : {}),

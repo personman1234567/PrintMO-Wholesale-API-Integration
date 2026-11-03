@@ -98,7 +98,9 @@ async function run() {
   const rejection = supplierError(400, { errors: [{ field: 'lines[0].identifier', message: 'Invalid SKU.' }] }, 'S&S rejected the order request (HTTP 400).');
   assert.equal(rejection.status, 400, 'deterministic S&S 4xx responses must remain 4xx');
   assert.equal(rejection.body.errors[0].message, 'Invalid SKU.');
-  assert.equal(supplierError(401, {}, 'Unauthorized').status, 502, 'supplier authentication failures must remain uncertain rather than reject an order');
+  const unauthorizedSupplier = supplierError(401, {}, 'Unauthorized');
+  assert.equal(unauthorizedSupplier.status, 401, 'preserve the native supplier authentication status');
+  assert.equal(unauthorizedSupplier.body.outcome, 'unknown', 'HTTP status preservation must not invent a known order rejection');
   const supplierEnv = {
     SS_ACCOUNT_NUMBER: 'fixture-account', SS_API_KEY: 'fixture-key',
     SS_PAYMENT_PROFILE_ID: '123', SS_PAYMENT_PROFILE_EMAIL: 'fixture@example.test',
@@ -161,7 +163,7 @@ async function run() {
   await assert.rejects(submitSsOrder(supplierOptions, {
     env: supplierEnv, wait: async () => {}, fetchImpl: async (url) => url.includes('/products/')
       ? fakeResponse(200, { customerPrice: 3.25 }) : fakeResponse(503, {}),
-  }), error => error.status === 502 && error.orderSubmissionAttempted === true);
+  }), error => error.status === 503 && error.body.outcome === 'unknown' && error.orderSubmissionAttempted === true);
   const adapterSource = fs.readFileSync(require.resolve('../phase2-data'), 'utf8');
   assert(adapterSource.indexOf("local prior = redis.call('GET', KEYS[5])") < adapterSource.indexOf('local current = tonumber'), 'idempotent retries must be resolved before version conflicts');
   assert(adapterSource.includes('`${prefix}:idempotency:${id}:${digest(idempotencyKey)}`'), 'idempotency keys must be scoped to an order');
