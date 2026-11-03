@@ -8,6 +8,8 @@ Response mapping selects the documented `sku` before numeric `skuID` independent
 
 The supplier operation is the Orders API POST in either mode; `testOrder` is not a website-cart operation. The gateway does not automate the owner's manual cancel/add-back-to-cart step.
 
+Supplier errors preserve the actual `upstreamHttpStatus` separately from the gateway HTTP status (for example, upstream 503 with gateway 502), the bounded native message/code, and `responseBodyFormat`. Non-JSON replies receive an explicit safe fallback; their raw body and headers are never returned. `orderSubmissionAttempted` remains the evidence for whether the order POST began; this change does not retry it or alter supplier flags/payloads.
+
 ## Read-only S&S inventory gateway
 
 Repeated `DS` rows in product warehouse metadata are accepted only when every repeated flag is `dropship: true`. Physical warehouse duplicates, conflicting flags, and duplicate inventory quantity rows still fail the read. DS quantities remain excluded from the Worker's physical stock count.

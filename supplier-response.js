@@ -122,13 +122,23 @@ function normalizeSsOrderResponse(payload, aggregate = {}) {
   };
 }
 
-function supplierError(status, payload, fallbackMessage) {
+function supplierError(status, payload, fallbackMessage, responseEvidence = {}) {
   const normalized = normalizeSsOrderResponse(payload);
-  const error = new Error(fallbackMessage);
+  const message = supplierMessage(payload, fallbackMessage);
+  const source = payload && typeof payload === 'object' ? payload : {};
+  const nested = value(source, ['error']);
+  const code = text(value(source, ['Code', 'ErrorCode', 'Type'])
+    ?? value(nested, ['Code', 'ErrorCode', 'Type'])).slice(0, 80);
+  const upstreamHttpStatus = Number(responseEvidence.upstreamHttpStatus ?? status);
+  const error = new Error(message);
   error.status = [400, 404, 422].includes(Number(status)) ? Number(status) : 502;
   error.body = {
     ...normalized,
-    error: { message: fallbackMessage },
+    ...(Number.isInteger(upstreamHttpStatus) && upstreamHttpStatus >= 100 && upstreamHttpStatus <= 599
+      ? { upstreamHttpStatus } : {}),
+    ...(['json', 'non_json'].includes(responseEvidence.responseBodyFormat)
+      ? { responseBodyFormat: responseEvidence.responseBodyFormat } : {}),
+    error: { ...(code ? { code } : {}), message },
   };
   return error;
 }

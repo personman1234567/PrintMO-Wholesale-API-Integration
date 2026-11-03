@@ -69,12 +69,15 @@ async function submitSsOrderRequest({ aggregate, orderCount, purchaseOrder, test
     },
     body: JSON.stringify(payload),
   });
-  const json = await response.json().catch(() => ({}));
-  if (!response.ok) throw supplierError(response.status, json, `S&S rejected the order request (HTTP ${response.status}).`);
+  let responseBodyFormat = 'json';
+  const json = await response.json().catch(() => { responseBodyFormat = 'non_json'; return {}; });
+  const responseEvidence = { upstreamHttpStatus: response.status, responseBodyFormat };
+  if (!response.ok) throw supplierError(response.status, json,
+    `S&S returned HTTP ${response.status}${responseBodyFormat === 'non_json' ? ' without a readable supplier message' : ''}.`, responseEvidence);
   const safeResponse = normalizeSsOrderResponse(json, aggregate);
   const created = safeResponse.Orders.find(order => order.OrderNumber);
   if (!created?.OrderNumber && safeResponse.outcome === 'unknown') {
-    throw supplierError(502, json, 'S&S did not confirm whether an order was created.');
+    throw supplierError(502, json, 'S&S did not confirm whether an order was created.', responseEvidence);
   }
   return {
     ...safeResponse,
