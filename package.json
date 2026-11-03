@@ -4,7 +4,7 @@
   "main": "index.js",
   "scripts": {
     "start": "node index.js",
-    "test": "npm run verify:phase2 && npm run verify:inventory && npm run verify:order-status && node --test scripts/supplier-response-contract.test.js",
+    "test": "npm run verify:phase2 && npm run verify:inventory && npm run verify:order-status && node --test scripts/supplier-response-contract.test.js scripts/supplier-native-throttle.test.js",
     "verify:phase2": "node scripts/verify-phase2.js",
     "verify:inventory": "node --test scripts/verify-inventory.js",
     "verify:order-status": "node --test scripts/verify-order-status.js"

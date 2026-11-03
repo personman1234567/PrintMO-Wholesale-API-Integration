@@ -10,6 +10,8 @@ The supplier operation is the Orders API POST in either mode; `testOrder` is not
 
 Supplier errors preserve the actual `upstreamHttpStatus` separately from the gateway HTTP status (for example, upstream 503 with gateway 502), the bounded native message/code, and `responseBodyFormat`. Non-JSON replies receive an explicit safe fallback; their raw body and headers are never returned. `orderSubmissionAttempted` remains the evidence for whether the order POST began; this change does not retry it or alter supplier flags/payloads.
 
+Only the exact native JSON 503/code 503 message `You are being throttled. Please wait 1 minute before your next request.` (whitespace normalized), without returned orders/references or positive accepted quantities, is classified as `failureKind: rate_limited` with `outcome: rejected`. This is a narrow operational inference, not a guarantee that no order exists: `orderSubmissionAttempted` stays true and the gateway never retries the POST. `retryAfterSeconds` is at least 60 and `retryAt` is anchored to `upstreamResponseAt`; valid Retry-After and X-Rate-Limit-Remaining values are the only captured response-header metadata. Generic/HTML/contradictory 503s stay unknown. The test-only `scripts/fixtures/supplier-commit-app.js` adapter registers the actual Express commit handler with a mocked native transport for local integration fixtures.
+
 ## Read-only S&S inventory gateway
 
 Repeated `DS` rows in product warehouse metadata are accepted only when every repeated flag is `dropship: true`. Physical warehouse duplicates, conflicting flags, and duplicate inventory quantity rows still fail the read. DS quantities remain excluded from the Worker's physical stock count.

@@ -130,14 +130,36 @@ function supplierError(status, payload, fallbackMessage, responseEvidence = {}) 
   const code = text(value(source, ['Code', 'ErrorCode', 'Type'])
     ?? value(nested, ['Code', 'ErrorCode', 'Type'])).slice(0, 80);
   const upstreamHttpStatus = Number(responseEvidence.upstreamHttpStatus ?? status);
+  const orderEvidence = ['Orders', 'OrderResults'].some(name => records(source, [name]).length > 0)
+    || ['OrderNumber', 'SupplierOrderNumber'].some(name => Boolean(text(value(source, [name]))))
+    || ['orderNumbers', 'supplierOrderNumbers'].some(name => records(source, [name]).some(number => Boolean(text(number))))
+    || ['acceptedLines', 'accepted_lines', 'Lines', 'lineItems'].some(name => records(source, [name])
+      .some(line => ['AcceptedQty', 'QtyOrdered', 'Quantity', 'Qty'].some(field => Number(value(line, [field])) > 0)));
+  // This exact native response is an intentional throttle inference, not a non-creation guarantee.
+  const rateLimited = upstreamHttpStatus === 503 && responseEvidence.responseBodyFormat === 'json'
+    && code === '503' && message.replace(/\s+/g, ' ').trim() === 'You are being throttled. Please wait 1 minute before your next request.'
+    && !orderEvidence;
+  const responseTime = Date.parse(responseEvidence.upstreamResponseAt);
+  const headerDelay = responseEvidence.retryAfterSeconds;
+  const retryAfterSeconds = rateLimited ? Math.max(60, Number.isSafeInteger(headerDelay) && headerDelay >= 0 ? headerDelay : 0)
+    : Number.isSafeInteger(headerDelay) && headerDelay >= 0 ? headerDelay : null;
+  const retryTime = Number.isFinite(responseTime) && retryAfterSeconds !== null ? responseTime + retryAfterSeconds * 1000 : NaN;
   const error = new Error(message);
   error.status = [400, 404, 422].includes(Number(status)) ? Number(status) : 502;
   error.body = {
     ...normalized,
+    ...(upstreamHttpStatus === 503 ? { outcome: rateLimited ? 'rejected' : 'unknown' } : {}),
+    ...(rateLimited ? { failureKind: 'rate_limited' } : {}),
+    ...(code ? { supplierErrorCode: code } : {}),
     ...(Number.isInteger(upstreamHttpStatus) && upstreamHttpStatus >= 100 && upstreamHttpStatus <= 599
       ? { upstreamHttpStatus } : {}),
     ...(['json', 'non_json'].includes(responseEvidence.responseBodyFormat)
       ? { responseBodyFormat: responseEvidence.responseBodyFormat } : {}),
+    ...(Number.isFinite(responseTime) ? { upstreamResponseAt: new Date(responseTime).toISOString() } : {}),
+    ...(Number.isFinite(retryTime) && Math.abs(retryTime) <= 8640000000000000
+      ? { retryAfterSeconds, retryAt: new Date(retryTime).toISOString() } : {}),
+    ...(Number.isSafeInteger(responseEvidence.rateLimitRemaining) && responseEvidence.rateLimitRemaining >= 0
+      ? { rateLimitRemaining: responseEvidence.rateLimitRemaining } : {}),
     error: { ...(code ? { code } : {}), message },
   };
   return error;
