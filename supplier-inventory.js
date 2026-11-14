@@ -1,4 +1,5 @@
-const MAX_SKUS = 25;
+const MAX_SKUS = 250;
+const CACHE_TTL_MS = 60000;
 const SKU_PATTERN = /^[A-Za-z0-9_-]{1,64}$/;
 const WAREHOUSE_PATTERN = /^[A-Z0-9]{1,8}$/;
 
@@ -9,111 +10,127 @@ function parseSkus(value) {
   return skus;
 }
 
-function normalizeInventory(payload, products, skus) {
-  if (!Array.isArray(payload) || payload.length > skus.length) throw new Error('INVALID_SUPPLIER_RESPONSE');
+// Products supplies live available-for-sale quantities and dropship flags together.
+// DS vendor duplicates are excluded by consumers; never merge physical rows.
+function normalizeProducts(products, skus) {
   if (!Array.isArray(products) || products.length > skus.length) throw new Error('INVALID_SUPPLIER_RESPONSE');
-  const requested = new Set(skus);
-  const productFlags = new Map();
-  for (const product of products) {
-    if (!product || !requested.has(product.sku) || productFlags.has(product.sku)
-      || !Array.isArray(product.warehouses) || !product.warehouses.length || product.warehouses.length > 100) {
-      throw new Error('INVALID_SUPPLIER_RESPONSE');
-    }
-    const flags = new Map();
+  const requested = new Set(skus), seen = new Set();
+  return products.map(product => {
+    if (!product || !requested.has(product.sku) || seen.has(product.sku)
+      || !Array.isArray(product.warehouses) || !product.warehouses.length || product.warehouses.length > 100) throw new Error('INVALID_SUPPLIER_RESPONSE');
+    seen.add(product.sku);
+    const warehouses = new Map();
     for (const warehouse of product.warehouses) {
       if (!warehouse || !WAREHOUSE_PATTERN.test(warehouse.warehouseAbbr)
-        || typeof warehouse.dropship !== 'boolean') {
+        || typeof warehouse.dropship !== 'boolean' || !Number.isSafeInteger(warehouse.qty) || warehouse.qty < 0) throw new Error('INVALID_SUPPLIER_RESPONSE');
+      if (warehouses.has(warehouse.warehouseAbbr)) {
+        if (warehouse.warehouseAbbr === 'DS' && warehouse.dropship === true && warehouses.get('DS').dropship === true) continue;
         throw new Error('INVALID_SUPPLIER_RESPONSE');
       }
-      if (flags.has(warehouse.warehouseAbbr)) {
-        // S&S can return multiple vendor rows under DS. They are all excluded
-        // from physical stock; only an unambiguous repeated dropship flag is safe.
-        if (warehouse.warehouseAbbr === 'DS' && warehouse.dropship === true
-          && flags.get('DS') === true) continue;
-        throw new Error('INVALID_SUPPLIER_RESPONSE');
-      }
-      flags.set(warehouse.warehouseAbbr, warehouse.dropship);
+      warehouses.set(warehouse.warehouseAbbr, { warehouseAbbr: warehouse.warehouseAbbr, qty: warehouse.qty, dropship: warehouse.dropship });
     }
-    productFlags.set(product.sku, flags);
-  }
-  const seen = new Set();
-  return payload.map(item => {
-    if (!item || !requested.has(item.sku) || seen.has(item.sku) || !Array.isArray(item.warehouses)
-      || !item.warehouses.length || item.warehouses.length > 100 || !productFlags.has(item.sku)) throw new Error('INVALID_SUPPLIER_RESPONSE');
-    seen.add(item.sku);
-    const warehouses = new Set();
-    return {
-      sku: item.sku,
-      warehouses: item.warehouses.map(warehouse => {
-        if (!warehouse || !WAREHOUSE_PATTERN.test(warehouse.warehouseAbbr)
-          || warehouses.has(warehouse.warehouseAbbr)
-          || !Number.isSafeInteger(warehouse.qty) || warehouse.qty < 0
-          || !productFlags.get(item.sku).has(warehouse.warehouseAbbr)) throw new Error('INVALID_SUPPLIER_RESPONSE');
-        warehouses.add(warehouse.warehouseAbbr);
-        return { warehouseAbbr: warehouse.warehouseAbbr, qty: warehouse.qty,
-          dropship: productFlags.get(item.sku).get(warehouse.warehouseAbbr) };
-      }),
-    };
+    return { sku: product.sku, warehouses: [...warehouses.values()] };
   });
 }
-
-async function getSupplierJson(fetchImpl, url, auth, sleep) {
-  for (let attempt = 0; attempt < 2; attempt++) {
-    let response;
-    try {
-      response = await fetchImpl(url, {
-        method: 'GET',
-        headers: { Accept: 'application/json', Authorization: `Basic ${auth}` },
-        redirect: 'error',
-        signal: AbortSignal.timeout(15000),
-      });
-    } catch {
-      throw new Error('UPSTREAM_TRANSPORT_FAILED');
-    }
-    if ((response.status === 429 || response.status >= 500) && attempt === 0) {
-      const retryAfter = response.headers.get('Retry-After');
-      const seconds = retryAfter === null ? 0.5 : /^\d+$/.test(retryAfter)
-        ? Number(retryAfter) : (Date.parse(retryAfter) - Date.now()) / 1000;
-      if (!Number.isFinite(seconds) || seconds > 2) throw new Error('UPSTREAM_RETRY_DEFERRED');
-      if (typeof response.body?.cancel === 'function') await response.body.cancel();
-      else if (typeof response.body?.destroy === 'function') response.body.destroy();
-      await sleep(Math.max(250, seconds * 1000));
-      continue;
-    }
-    if (!response.ok) throw new Error(`UPSTREAM_HTTP_${response.status}`);
-    let payload;
-    try { payload = await response.json(); }
-    catch { throw new Error('UPSTREAM_INVALID_JSON'); }
-    return payload;
+function resetTime(value, now) {
+  if (!value) return null;
+  if (/^\d+(?:\.\d+)?$/.test(value)) {
+    const n = Number(value);
+    return n > 1e12 ? n : n > 1e9 ? n * 1000 : now + n * 1000;
   }
-  throw new Error('UPSTREAM_RETRY_EXHAUSTED');
+  // S&S's ISO reset value lacks a suffix but denotes UTC, not host local time.
+  const parsed = Date.parse(/^\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d(?:\.\d+)?$/.test(value) ? value + 'Z' : value);
+  return Number.isFinite(parsed) ? parsed : null;
+}
+function retryTime(value, now) {
+  if (!value) return null;
+  const parsed = /^\d+$/.test(value) ? now + Number(value) * 1000 : Date.parse(value);
+  return Number.isFinite(parsed) ? parsed : null;
+}
+function deferred(code, retryAt, now) {
+  const error = new Error(code);
+  error.retryAfterSeconds = Math.max(1, Math.ceil((retryAt - now) / 1000));
+  return error;
 }
 
-async function getSupplierInventory(fetchImpl, skus, credentials, sleep = ms => new Promise(resolve => setTimeout(resolve, ms))) {
-  const suffix = skus.map(encodeURIComponent).join(',');
-  const auth = Buffer.from(`${credentials.accountNumber}:${credentials.apiKey}`).toString('base64');
-  const inventory = await getSupplierJson(fetchImpl, `https://api.ssactivewear.com/v2/inventory/${suffix}`, auth, sleep);
-  const products = await getSupplierJson(fetchImpl, `https://api.ssactivewear.com/v2/products/${suffix}`, auth, sleep);
-  return { observedAt: new Date().toISOString(), items: normalizeInventory(inventory, products, skus) };
+// Per gateway instance/account: serialize fills, coalesce overlap, reserve ten
+// requests for other consumers, cap this reader at forty starts per rolling minute.
+function createSupplierInventoryReader({ fetchImpl, accountNumber, apiKey, now = Date.now,
+  sleep = ms => new Promise(resolve => setTimeout(resolve, ms)) } = {}) {
+  const auth = Buffer.from(accountNumber + ':' + apiKey).toString('base64');
+  const cache = new Map(), starts = [];
+  let tail = Promise.resolve(), queued = 0, blockedUntil = 0, nextStart = 0;
+  async function read(skus) {
+    const current = now();
+    const missing = skus.filter(sku => {
+      const entry = cache.get(sku);
+      return !entry || current < entry.fetchedAt || current - entry.fetchedAt >= CACHE_TTL_MS;
+    });
+    if (missing.length) {
+      while (starts.length && starts[0] <= now() - 60000) starts.shift();
+      const slot = Math.max(blockedUntil, nextStart, starts.length >= 40 ? starts[0] + 60000 : 0);
+      if (slot - now() > 2000) throw deferred('SUPPLIER_RATE_LIMITED', slot, now());
+      if (slot > now()) await sleep(slot - now());
+      const fetchedAt = now();
+      starts.push(fetchedAt); nextStart = fetchedAt + 1500;
+      let response;
+      try {
+        response = await fetchImpl('https://api.ssactivewear.com/v2/products/' + missing.map(encodeURIComponent).join(',') + '?fields=sku,styleID,warehouses', {
+          method: 'GET', headers: { Accept: 'application/json', Authorization: 'Basic ' + auth },
+          redirect: 'error', signal: AbortSignal.timeout(15000),
+        });
+      } catch { throw new Error('UPSTREAM_TRANSPORT_FAILED'); }
+      const remainingHeader = response.headers.get('x-rate-limit-remaining'), limitHeader = response.headers.get('x-rate-limit-limit');
+      const remaining = remainingHeader !== null && /^\d+$/.test(remainingHeader) ? Number(remainingHeader) : null;
+      const limit = limitHeader !== null && /^\d+$/.test(limitHeader) ? Number(limitHeader) : null;
+      const reset = resetTime(response.headers.get('x-rate-limit-reset'), now()), retry = retryTime(response.headers.get('Retry-After'), now());
+      if (limit > 0) nextStart = Math.max(nextStart, fetchedAt + Math.ceil(60000 / Math.max(1, Math.min(40, limit - 10))));
+      if ((remaining !== null && remaining <= 10) || response.status === 429 || response.status === 503) {
+        blockedUntil = Math.max(blockedUntil, reset > now() ? reset + 1000 : now() + 60000, retry || 0);
+      }
+      if (!response.ok) {
+        if (typeof response.body?.cancel === 'function') await response.body.cancel();
+        else if (typeof response.body?.destroy === 'function') response.body.destroy();
+        if (response.status === 429 || response.status === 503) throw deferred('SUPPLIER_RATE_LIMITED', blockedUntil, now());
+        const error = new Error('UPSTREAM_HTTP_' + response.status);
+        if (response.status >= 500) error.retryAfterSeconds = Math.max(1, Math.ceil(((retry || now() + 60000) - now()) / 1000));
+        throw error;
+      }
+      let payload;
+      try { payload = await response.json(); } catch { throw new Error('UPSTREAM_INVALID_JSON'); }
+      const items = normalizeProducts(payload, missing), bySku = new Map(items.map(item => [item.sku, item]));
+      if (now() - fetchedAt >= CACHE_TTL_MS) throw new Error('SUPPLIER_SOURCE_STALE');
+      for (const sku of missing) { cache.delete(sku); cache.set(sku, { fetchedAt, item: bySku.get(sku) || null }); }
+      // Successful omissions stay omissions. Bound memory without stale fallback.
+      while (cache.size > 30000) cache.delete(cache.keys().next().value);
+    }
+    const entries = skus.map(sku => cache.get(sku));
+    if (entries.some(entry => !entry || now() < entry.fetchedAt || now() - entry.fetchedAt >= CACHE_TTL_MS)) throw new Error('SUPPLIER_SOURCE_STALE');
+    return { observedAt: new Date(Math.min(...entries.map(entry => entry.fetchedAt))).toISOString(), items: entries.flatMap(entry => entry.item ? [entry.item] : []) };
+  }
+  return skus => {
+    if (!Array.isArray(skus) || !parseSkus(skus.join(','))) return Promise.reject(new Error('INVALID_SKUS'));
+    if (queued >= 8) return Promise.reject(deferred('SUPPLIER_RATE_LIMITED', now() + 2000, now()));
+    queued++;
+    const result = tail.then(() => read(skus)).finally(() => { queued--; });
+    tail = result.catch(() => {});
+    return result;
+  };
 }
-
-function createSupplierInventoryHandler({ fetchImpl, accountNumber, apiKey, sleep } = {}) {
+function createSupplierInventoryHandler(options = {}) {
+  const read = createSupplierInventoryReader(options);
   return async (req, res) => {
     res.set('Cache-Control', 'no-store');
-    if (Object.keys(req.query).length !== 1 || !Object.hasOwn(req.query, 'skus')) {
-      return res.status(400).json({ error: 'INVALID_SKUS' });
-    }
+    if (Object.keys(req.query).length !== 1 || !Object.hasOwn(req.query, 'skus')) return res.status(400).json({ error: 'INVALID_SKUS' });
     const skus = parseSkus(req.query.skus);
     if (!skus) return res.status(400).json({ error: 'INVALID_SKUS' });
-    if (!accountNumber || !apiKey) return res.status(503).json({ error: 'SUPPLIER_NOT_CONFIGURED' });
-    try {
-      return res.json(await getSupplierInventory(fetchImpl, skus, { accountNumber, apiKey }, sleep));
-    } catch (error) {
-      const code = /^UPSTREAM_[A-Z0-9_]+$|^INVALID_SUPPLIER_RESPONSE$/.test(error?.message || '')
-        ? error.message : 'SUPPLIER_READ_FAILED';
-      return res.status(502).json({ error: code });
+    if (!options.accountNumber || !options.apiKey) return res.status(503).json({ error: 'SUPPLIER_NOT_CONFIGURED' });
+    try { return res.json(await read(skus)); }
+    catch (error) {
+      const code = /^UPSTREAM_[A-Z0-9_]+$|^INVALID_SUPPLIER_RESPONSE$|^SUPPLIER_(RATE_LIMITED|SOURCE_STALE)$/.test(error?.message || '') ? error.message : 'SUPPLIER_READ_FAILED';
+      if (error.retryAfterSeconds) res.set('Retry-After', String(error.retryAfterSeconds));
+      return res.status(code === 'SUPPLIER_RATE_LIMITED' ? 429 : 502).json({ error: code });
     }
   };
 }
-
-module.exports = { createSupplierInventoryHandler, getSupplierInventory, normalizeInventory, parseSkus };
+module.exports = { MAX_SKUS, CACHE_TTL_MS, createSupplierInventoryHandler, createSupplierInventoryReader, normalizeProducts, parseSkus };
