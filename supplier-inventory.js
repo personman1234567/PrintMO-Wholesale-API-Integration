@@ -3,6 +3,13 @@ const CACHE_TTL_MS = 60000;
 const SKU_PATTERN = /^[A-Za-z0-9_-]{1,64}$/;
 const WAREHOUSE_PATTERN = /^[A-Z0-9]{1,8}$/;
 
+function customerCost(value) {
+  if (!['string', 'number'].includes(typeof value)) return null;
+  const text = String(value).trim();
+  if (!/^\d{1,7}(?:\.\d{1,2}0*)?$/.test(text) || Number(text) <= 0) return null;
+  return Number(text).toFixed(2);
+}
+
 function parseSkus(value) {
   if (typeof value !== 'string') return null;
   const skus = value.split(',');
@@ -29,7 +36,8 @@ function normalizeProducts(products, skus) {
       }
       warehouses.set(warehouse.warehouseAbbr, { warehouseAbbr: warehouse.warehouseAbbr, qty: warehouse.qty, dropship: warehouse.dropship });
     }
-    return { sku: product.sku, warehouses: [...warehouses.values()] };
+    return { sku: product.sku, warehouses: [...warehouses.values()],
+      ...(Object.hasOwn(product, 'customerPrice') ? { customerPrice: customerCost(product.customerPrice) } : {}) };
   });
 }
 function resetTime(value, now) {
@@ -75,7 +83,7 @@ function createSupplierInventoryReader({ fetchImpl, accountNumber, apiKey, now =
       starts.push(fetchedAt); nextStart = fetchedAt + 1500;
       let response;
       try {
-        response = await fetchImpl('https://api.ssactivewear.com/v2/products/' + missing.map(encodeURIComponent).join(',') + '?fields=sku,styleID,warehouses', {
+        response = await fetchImpl('https://api.ssactivewear.com/v2/products/' + missing.map(encodeURIComponent).join(',') + '?fields=sku,styleID,warehouses,customerPrice', {
           method: 'GET', headers: { Accept: 'application/json', Authorization: 'Basic ' + auth },
           redirect: 'error', signal: AbortSignal.timeout(15000),
         });
