@@ -70,7 +70,7 @@ test('250-SKU handler makes one authenticated products GET and emits no supplier
   assert.equal(f.calls.length, 1); assert.equal(res.statusCode, 200); assert.equal(res.body.items.length, 250);
   assert.equal(f.calls[0].options.method, 'GET'); assert.equal(f.calls[0].options.redirect, 'error');
   assert.match(f.calls[0].options.headers.Authorization, /^Basic /);
-  assert.equal(new URL(f.calls[0].url).searchParams.get('fields'), 'sku,styleID,warehouses');
+  assert.equal(new URL(f.calls[0].url).searchParams.get('fields'), 'sku,styleID,warehouses,customerPrice');
   assert.equal(res.headers['Cache-Control'], 'no-store');
   assert.doesNotMatch(JSON.stringify(res.body), /private|secret|account/);
 });
@@ -129,5 +129,19 @@ test('invalid requests, missing credentials and upstream errors never become sto
   for(const [payload,status,code] of [[{private:'detail'},404,'UPSTREAM_HTTP_404'],[[{sku,warehouses:[]}],200,'INVALID_SUPPLIER_RESPONSE']]){
     const failed=result();await createSupplierInventoryHandler({...f.options,fetchImpl:async()=>reply(payload,status)})({query:{skus:sku}},failed);
     assert.equal(failed.statusCode,502);assert.deepEqual(failed.body,{error:code});
+  }
+});
+
+
+test('account cost survives the same cached read; unusable prices never invalidate stock', async () => {
+  const f = fixture(skus => reply(skus.map(sku => ({...row(sku), customerPrice: '2.3400'}))));
+  const read = createSupplierInventoryReader(f.options), first = await read([sku]);
+  f.advance(1000);
+  const cached = await read([sku]);
+  assert.equal(first.items[0].customerPrice, '2.34');
+  assert.deepEqual(cached, first); assert.equal(f.calls.length, 1);
+  for (const price of [undefined, null, '', 0, -1, 'garbage', '2.345']) {
+    const [item] = normalizeProducts([{...row(sku), customerPrice: price}], [sku]);
+    assert.equal(item.customerPrice, null); assert.equal(item.warehouses[0].qty, 8);
   }
 });
